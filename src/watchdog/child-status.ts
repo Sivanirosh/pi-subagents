@@ -169,6 +169,21 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 	};
 }
 
+function childWatchdogString(value: string | null | undefined): value is string {
+	return value !== null && value !== undefined && Object(value) !== value && value.constructor === String;
+}
+
+function isChildWatchdogEffectSettlement(value: ChildWatchdogEffectSettlement | null): value is ChildWatchdogEffectSettlement {
+	if (value === null || Object(value) !== value || Array.isArray(value)) return false;
+	return (value.status === "settled" || value.status === "unresolved")
+		&& childWatchdogString(value.toolName)
+		&& value.toolName.trim().length > 0
+		&& (value.toolCallId === undefined || childWatchdogString(value.toolCallId))
+		&& (value.reason === undefined
+			|| value.reason === "execution-ended-before-tool-return"
+			|| value.reason === "cancelled-before-tool-return");
+}
+
 export function isChildWatchdogStatusEvent(value: unknown): value is ChildWatchdogStatusEvent {
 	if (!value || typeof value !== "object") return false;
 	const event = value as Partial<ChildWatchdogStatusEvent>;
@@ -179,7 +194,8 @@ export function isChildWatchdogStatusEvent(value: unknown): value is ChildWatchd
 		&& typeof event.ts === "number"
 		&& Number.isFinite(event.ts)
 		&& typeof event.phase === "string"
-		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase);
+		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase)
+		&& (event.effectSettlement === undefined || isChildWatchdogEffectSettlement(event.effectSettlement));
 }
 
 export function childWatchdogIsActive(snapshot: ChildWatchdogStateSnapshot | undefined): boolean {
@@ -194,6 +210,7 @@ export function acceptChildWatchdogEvent(input: {
 	agent?: string;
 	childIndex?: number;
 }): ChildWatchdogStateSnapshot | undefined {
+	if (!isChildWatchdogStatusEvent(input.event)) return undefined;
 	if (input.runId !== undefined && input.event.runId !== input.runId) return undefined;
 	if (input.agent !== undefined && input.event.agent !== input.agent) return undefined;
 	const eventIndex = input.event.childIndex ?? input.event.stepIndex;

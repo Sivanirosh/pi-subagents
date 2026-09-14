@@ -289,7 +289,7 @@ describe("subagent prompt runtime", () => {
 		assert.equal(await advisoryToolCall!({ toolName: "write", input: {} }, ctx), undefined, "advisory status does not deny a new call");
 
 		const model = { provider: "test", id: "watchdog", name: "watchdog", api: "faux", baseUrl: "https://example.invalid", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 4_096 };
-		const staleHandlers = install({ ...watchdogConfig, blockOnFailure: true, agentEndTimeoutMs: 5, cadence: { everyNTools: 5 } });
+		const { handlers: staleHandlers, statusEvents } = installWatchdogRegistration({ ...watchdogConfig, blockOnFailure: true, agentEndTimeoutMs: 5, cadence: { everyNTools: 5 } });
 		const staleCtx = {
 			cwd: process.cwd(), signal: undefined, model,
 			sessionManager: { getSessionId: () => "stale-gate" },
@@ -300,11 +300,26 @@ describe("subagent prompt runtime", () => {
 		staleHandlers.get("turn_end")?.[0]?.({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "work" }] } }, staleCtx);
 		for (let i = 0; i < 5; i++) staleHandlers.get("tool_result")?.[0]?.({ type: "tool_result", toolName: "write", content: [{ type: "text", text: "started" }] }, staleCtx);
 		await new Promise((resolve) => setTimeout(resolve, 30));
-		const staleDecision = await staleHandlers.get("tool_call")?.[0]?.({ toolName: "write", input: {} }, staleCtx);
+		const staleDecision = await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "denied-effect", toolName: "write", input: {} }, staleCtx);
 		assert.deepEqual(staleDecision, { block: true, reason: "Blocked by pi-subagents watchdog: child supervision status is stale." });
+
+		// Pi emits execution_start before tool_call. A denied preflight must not
+		// become the effect reported after the next session admission.
+		staleHandlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "denied-effect", toolName: "write", args: {} }, staleCtx);
+		const deniedEffect = await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "denied-effect", toolName: "write", input: {} }, staleCtx);
+		assert.deepEqual(deniedEffect, { block: true, reason: "Blocked by pi-subagents watchdog: child supervision status is stale." });
+		await staleHandlers.get("session_start")?.[0]?.({}, staleCtx);
+		staleHandlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "admitted-effect", toolName: "write", args: {} }, staleCtx);
+		assert.equal(await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "admitted-effect", toolName: "write", input: {} }, staleCtx), undefined);
+		staleHandlers.get("tool_result")?.[0]?.({ type: "tool_result", toolCallId: "admitted-effect", toolName: "write", content: [], isError: false }, staleCtx);
+		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
+			status: "settled",
+			toolName: "write",
+			toolCallId: "admitted-effect",
+		});
 	});
 
-	const installWatchdogRegistration = () => {
+	const installWatchdogRegistration = (config: ChildWatchdogConfig = watchdogConfig) => {
 		type RegistrationHandler = (event?: WatchdogHookEvent, ctx?: WatchdogHookContext) => WatchdogAdmissionResult | undefined | Promise<WatchdogAdmissionResult | undefined>;
 		const handlers = new Map<string, RegistrationHandler[]>();
 		const statusEvents: ChildWatchdogStatusEvent[] = [];
@@ -315,7 +330,7 @@ describe("subagent prompt runtime", () => {
 			},
 			getThinkingLevel: () => "off",
 			sendMessage: () => {},
-		} as never, childConfig({ childWatchdog: watchdogConfig, watchdogStatus: (event) => statusEvents.push(event) }));
+		} as never, childConfig({ childWatchdog: config, watchdogStatus: (event) => statusEvents.push(event) }));
 		return { handlers, statusEvents };
 	};
 
@@ -324,6 +339,7 @@ describe("subagent prompt runtime", () => {
 		const ctx = { cwd: process.cwd(), signal: undefined };
 		await handlers.get("session_start")?.[0]?.({}, ctx);
 		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-1", toolName: "write", args: { path: "out.txt" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-1", toolName: "write", input: {} }, ctx), undefined);
 		handlers.get("tool_result")?.[0]?.({ type: "tool_result", toolCallId: "effect-1", toolName: "write", content: [], isError: false }, ctx);
 		handlers.get("tool_execution_end")?.[0]?.({ type: "tool_execution_end", toolCallId: "effect-1", toolName: "write", result: {}, isError: false }, ctx);
 		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
@@ -338,6 +354,7 @@ describe("subagent prompt runtime", () => {
 		const ctx = { cwd: process.cwd(), signal: undefined };
 		await handlers.get("session_start")?.[0]?.({}, ctx);
 		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-2", toolName: "bash", args: { command: "long-running" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-2", toolName: "bash", input: {} }, ctx), undefined);
 		await handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown", reason: "quit" }, ctx);
 		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
 			status: "unresolved",
@@ -352,6 +369,7 @@ describe("subagent prompt runtime", () => {
 		const ctx = { cwd: process.cwd(), signal: undefined };
 		await handlers.get("session_start")?.[0]?.({}, ctx);
 		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-abort", toolName: "bash", args: { command: "long-running" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-abort", toolName: "bash", input: {} }, ctx), undefined);
 		const controller = new AbortController();
 		controller.abort();
 		await handlers.get("agent_end")?.[0]?.({ type: "agent_end", messages: [{ stopReason: "aborted" }] }, { ...ctx, signal: controller.signal });
@@ -368,6 +386,7 @@ describe("subagent prompt runtime", () => {
 		const ctx = { cwd: process.cwd(), signal: undefined };
 		await handlers.get("session_start")?.[0]?.({}, ctx);
 		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-3", toolName: "edit", args: { path: "out.txt" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-3", toolName: "edit", input: {} }, ctx), undefined);
 		handlers.get("tool_execution_end")?.[0]?.({ type: "tool_execution_end", toolCallId: "effect-3", toolName: "edit", result: {}, isError: false }, ctx);
 		await handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown", reason: "quit" }, ctx);
 		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {

@@ -164,6 +164,32 @@ describe("child watchdog status helpers", () => {
 		);
 	});
 
+	it("rejects malformed effect settlements while preserving omitted settlements", () => {
+		const base = {
+			type: CHILD_WATCHDOG_STATUS_EVENT,
+			seq: 1,
+			phase: "idle",
+			ts: 10,
+		} as const;
+		assert.equal(isChildWatchdogStatusEvent(base), true);
+		assert.equal(isChildWatchdogStatusEvent({ ...base, effectSettlement: { status: "settled", toolName: "write" } }), true);
+		for (const effectSettlement of [
+			{ status: "done", toolName: "write" },
+			{ status: "settled", toolName: "" },
+			{ status: "settled", toolName: "   " },
+			{ status: "settled" },
+			{ status: "settled", toolName: "write", toolCallId: 1 },
+			{ status: "settled", toolName: "write", reason: "unknown" },
+			null,
+		]) {
+			assert.equal(isChildWatchdogStatusEvent({ ...base, effectSettlement }), false, JSON.stringify(effectSettlement));
+		}
+		const accepted = acceptChildWatchdogEvent({ event: { ...base, effectSettlement: { status: "settled", toolName: "write" } }, current: undefined });
+		assert.deepEqual(accepted?.effectSettlement, { status: "settled", toolName: "write" });
+		// SAFETY: This deliberately bypasses static event typing to feed a malformed settlement into the fail-closed validator.
+		assert.equal(acceptChildWatchdogEvent({ event: { ...base, effectSettlement: { status: "done", toolName: "write" } } as never, current: undefined }), undefined);
+	});
+
 	it("accepts latest matching status events and drops stale or foreign events", () => {
 		const firstEvent = {
 			type: CHILD_WATCHDOG_STATUS_EVENT,

@@ -66,6 +66,7 @@ export function registerChildWatchdog(
 	let currentContext: ExtensionContext | undefined;
 	let diffBaseline: WatchdogDiffBaseline | undefined;
 	let observedEffect: { toolCallId?: string; toolName: string; executionEnded: boolean } | undefined;
+	let pendingEffect: { toolCallId?: string; toolName: string } | undefined;
 	let seq = 0;
 	const emitStatus = (phase: ChildWatchdogPhase, reason?: string, effectSettlement?: ChildWatchdogEffectSettlement): void => {
 		const status: ChildWatchdogStatusEvent = {
@@ -137,24 +138,30 @@ export function registerChildWatchdog(
 		emitStatus(status === "failed" || status === "reviewing" || status === "stale" ? status : "idle", undefined, settled);
 	});
 	onRuntimeEvent<ToolExecutionStartEvent>("tool_execution_start", (event) => {
-		// One-effect observation deliberately does not infer settlement for overlapping sibling calls.
-		if (!observedEffect) {
-			observedEffect = { toolName: event.toolName, executionEnded: false, toolCallId: event.toolCallId };
-		}
+		// Pi emits this preflight event before tool_call admission. Keep it pending
+		// until the gate allows the matching call, so denied calls cannot occupy the tracker.
+		if (!observedEffect) pendingEffect = { toolName: event.toolName, toolCallId: event.toolCallId };
 	});
 	onRuntimeEvent<ToolExecutionEndEvent>("tool_execution_end", (event) => {
 		if (effectMatches(event) && observedEffect) observedEffect.executionEnded = true;
 	});
 	// This is an admission gate only: Pi checks the synchronous result before
 	// execution, while calls admitted before a later watchdog failure continue.
-	onRuntimeEvent("tool_call", () => {
-		if (!childConfig.blockOnFailure) return undefined;
+	onRuntimeEvent("tool_call", (event: { toolCallId: string }) => {
 		const status = runtime.getSnapshot().status;
-		if (status !== "failed" && status !== "stale") return undefined;
-		return { block: true, reason: `Blocked by pi-subagents watchdog: child supervision status is ${status}.` };
+		if (childConfig.blockOnFailure && (status === "failed" || status === "stale")) {
+			if (pendingEffect?.toolCallId === event.toolCallId) pendingEffect = undefined;
+			return { block: true, reason: `Blocked by pi-subagents watchdog: child supervision status is ${status}.` };
+		}
+		if (!observedEffect && pendingEffect?.toolCallId === event.toolCallId) {
+			observedEffect = { ...pendingEffect, executionEnded: false };
+			pendingEffect = undefined;
+		}
+		return undefined;
 	});
 	onRuntimeEvent<AgentEndEvent>("agent_end", async (event, ctx) => {
 		rememberContext(ctx);
+		pendingEffect = undefined;
 		const aborted = ctx.signal?.aborted === true || event.messages.some((message) => "stopReason" in message && message.stopReason === "aborted");
 		if (aborted) {
 			const unresolved = observeUnresolvedEffect();
@@ -169,6 +176,7 @@ export function registerChildWatchdog(
 		else emitStatus("idle");
 	});
 	onRuntimeEvent("session_shutdown", () => {
+		pendingEffect = undefined;
 		const unresolved = observeUnresolvedEffect();
 		observedEffect = undefined;
 		currentContext = undefined;
