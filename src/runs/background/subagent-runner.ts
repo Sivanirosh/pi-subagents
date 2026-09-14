@@ -18,7 +18,6 @@ import { isStorageCapacityError } from "../../shared/file-system-retry.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, consumeStopRequestPayloads, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, watchAsyncControlInbox, type SteerRequest, type StopRequest } from "./control-channel.ts";
-import { deadlineCheckpointDelayMs } from "./deadline-checkpoint.ts";
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths, writeArtifact, writeMetadata } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
@@ -3574,8 +3573,10 @@ export async function runSubagent(
 		timeoutTimer = setTimeout(timeoutRunner, remainingMs);
 		timeoutTimer.unref?.();
 		// Route the pre-deadline checkpoint like any external steer so its lifecycle records the receipt.
-		const checkpointDelayMs = deadlineCheckpointDelayMs(remainingMs, config.checkpointBeforeDeadlineMs);
-		if (checkpointDelayMs !== undefined) {
+		const checkpointDelayMs = config.checkpointBeforeDeadlineMs === undefined
+			? undefined
+			: remainingMs - config.checkpointBeforeDeadlineMs;
+		if (checkpointDelayMs !== undefined && checkpointDelayMs >= 1_000) {
 			const deadlineAt = config.deadlineAt;
 			checkpointTimer = setTimeout(() => {
 				checkpointTimer = undefined;

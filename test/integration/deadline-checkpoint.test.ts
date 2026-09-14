@@ -107,4 +107,20 @@ describe("async single-agent deadline checkpoint lifecycle", { skip: !available 
 		assert.ok(terminal.pid);
 		assert.throws(() => process.kill(terminal.pid!, 0), { code: "ESRCH" }, "runner exits rather than waiting for timers");
 	});
+
+	it("does not schedule a checkpoint less than one second after launch", {
+		skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined,
+		timeout: 10_000,
+	}, async () => {
+		mockPi.onCall({ steps: [{ waitForPath: path.join(tempDir, "never-released") }] });
+		const executor = makeAsyncExecutor([makeAgent("worker", { completionGuard: false })]);
+		const result = await executor.execute("checkpoint-short-lead", {
+			agent: "worker", task: "Wait", async: true, clarify: false,
+			timeoutMs: 800, checkpointBeforeDeadlineMs: 100,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const id = result.details?.asyncId;
+		assert.ok(id);
+		await waitForAsyncResultFile(id, 5_000);
+		assert.deepEqual(journal(id).filter((event) => event.source === "deadline-checkpoint"), []);
+	});
 });
