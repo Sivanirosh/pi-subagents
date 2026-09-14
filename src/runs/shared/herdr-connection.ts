@@ -33,15 +33,17 @@ function sshEnvCommand(session: string | undefined, command: string): string { c
 
 export function runHerdrRemoteCommand(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}) { return spawnSync(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { encoding: "utf8", env: hardenedSshEnv(options.env), timeout: options.timeout ?? 15_000, maxBuffer: options.maxBuffer ?? MAX_DISCOVERY_BYTES, windowsHide: true }); }
 
-export function runHerdrRemoteCommandAsync(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
-	return new Promise((resolve, reject) => {
+export function runHerdrRemoteCommandAsync(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+	return new Promise((resolve) => {
 		const child = spawn(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { env: hardenedSshEnv(options.env), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-		const stdout: Buffer[] = [], stderr: Buffer[] = []; let bytes = 0;
-		const collect = (target: Buffer[]) => (chunk: Buffer) => { bytes += chunk.byteLength; if (bytes > (options.maxBuffer ?? MAX_DISCOVERY_BYTES)) child.kill("SIGTERM"); else target.push(chunk); };
-		child.stdout.on("data", collect(stdout)); child.stderr.on("data", collect(stderr));
-		child.once("error", reject);
-		child.once("close", (status) => { clearTimeout(timer); resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }); });
-		const timer = setTimeout(() => child.kill("SIGTERM"), options.timeout ?? 15_000); timer.unref?.();
+		const stdout: Buffer[] = [], stderr: Buffer[] = [], maxBuffer = options.maxBuffer ?? MAX_DISCOVERY_BYTES; let stdoutBytes = 0, stderrBytes = 0, error: Error | undefined, settled = false, escalation: NodeJS.Timeout | undefined;
+		const finish = (status: number | null, spawnError = error) => { if (settled) return; settled = true; clearTimeout(timer); if (escalation) clearTimeout(escalation); resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), ...(spawnError ? { error: spawnError } : {}) }); };
+		const terminate = () => { child.kill("SIGTERM"); escalation ??= setTimeout(() => { if (!settled) child.kill("SIGKILL"); }, 1_000); escalation.unref?.(); };
+		const collect = (target: Buffer[], stream: "stdout" | "stderr") => (chunk: Buffer) => { const bytes = stream === "stdout" ? (stdoutBytes += chunk.byteLength) : (stderrBytes += chunk.byteLength); if (bytes > maxBuffer) { error ??= new Error(`${stream} maxBuffer length exceeded`); terminate(); } else target.push(chunk); };
+		child.stdout.on("data", collect(stdout, "stdout")); child.stderr.on("data", collect(stderr, "stderr"));
+		child.once("error", (spawnError) => finish(null, spawnError));
+		child.once("close", (status) => finish(status));
+		const timer = setTimeout(terminate, options.timeout ?? 15_000); timer.unref?.();
 	});
 }
 
