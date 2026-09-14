@@ -1373,8 +1373,7 @@ export function executeAsyncChain(
 	const acceptanceErrors = validateExecutionAcceptance({
 		chain: projectChainOutputSchemas(chain, agents,
 			(step, outputSchema) => ({ acceptance: step.acceptance, outputSchema }),
-			(_step, children) => ({ parallel: children }),
-			(step, child) => ({ acceptance: "acceptance" in step ? step.acceptance : undefined, parallel: child })),
+			(step, parallel) => Array.isArray(step.parallel) ? { parallel } : { acceptance: "acceptance" in step ? step.acceptance : undefined, parallel }),
 	});
 	if (acceptanceErrors.length > 0) return formatAsyncStartError(resultMode, acceptanceErrors.join(" "));
 	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
