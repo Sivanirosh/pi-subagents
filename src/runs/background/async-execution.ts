@@ -14,7 +14,7 @@ import { createAtomicJsonWriter, writePrivateAtomicJson } from "../../shared/ato
 import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
-import { planChildLaunch, resolveEffectiveOutputSchema, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
+import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
 import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../shared/herdr-machine.ts";
 import { applyThinkingSuffix, getHostBuiltinToolNames, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -942,13 +942,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (!agents.find((x) => x.name === agentName)) return { error: formatUnknownAgentError(agentName, diagnosticContext) };
 		}
 	}
-	const effectiveOutputSchema = (step: SequentialStep): JsonSchemaObject | undefined => resolveEffectiveOutputSchema(agents.find((agent) => agent.name === step.agent)!, step.outputSchema);
-	const withEffectiveOutputSchema = (step: SequentialStep): SequentialStep => ({ ...step, outputSchema: effectiveOutputSchema(step) });
-	const graphSteps = graphChain.map((step): ChainStep => {
-		if (isParallelStep(step)) return { ...step, parallel: step.parallel.map(withEffectiveOutputSchema) };
-		if (isDynamicParallelStep(step)) return { ...step, parallel: withEffectiveOutputSchema(step.parallel) };
-		return withEffectiveOutputSchema(step);
-	});
+	const graphSteps = projectChainOutputSchemas(graphChain, agents) as ChainStep[];
 	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: graphSteps });
 
 	let progressInstructionCreated = false;
@@ -1376,17 +1370,11 @@ export function executeAsyncChain(
 		nestedRoute,
 	} = params;
 	const resultMode = params.resultMode ?? "chain";
-	const effectiveOutputSchema = (step: SequentialStep): JsonSchemaObject | undefined => {
-		const agent = agents.find((candidate) => candidate.name === step.agent);
-		return agent && resolveEffectiveOutputSchema(agent, step.outputSchema);
-	};
-	const withEffectiveOutputSchema = (step: SequentialStep): SequentialStep => ({ ...step, outputSchema: effectiveOutputSchema(step) });
 	const acceptanceErrors = validateExecutionAcceptance({
-		chain: chain.map((step) => {
-			if (isParallelStep(step)) return { parallel: step.parallel.map(withEffectiveOutputSchema) };
-			if (isDynamicParallelStep(step)) return { acceptance: step.acceptance, parallel: withEffectiveOutputSchema(step.parallel) };
-			return { acceptance: step.acceptance, outputSchema: effectiveOutputSchema(step) };
-		}),
+		chain: projectChainOutputSchemas(chain, agents,
+			(step, outputSchema) => ({ acceptance: step.acceptance, outputSchema }),
+			(_step, children) => ({ parallel: children }),
+			(step, child) => ({ acceptance: "acceptance" in step ? step.acceptance : undefined, parallel: child })),
 	});
 	if (acceptanceErrors.length > 0) return formatAsyncStartError(resultMode, acceptanceErrors.join(" "));
 	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);

@@ -31,7 +31,7 @@ import { applyWatchdogLaunchRules } from "../../watchdog/rules.ts";
 import { childWatchdogProgressForModel } from "../../watchdog/child-status.ts";
 import { buildModelCandidates, normalizeParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, type ModelOrigin, type ParentModel } from "../shared/model-fallback.ts";
 import { getHostBuiltinToolNames } from "../shared/child-tool-plan.ts";
-import { resolveEffectiveOutputSchema } from "../shared/child-launch-plan.ts";
+import { projectChainOutputSchemas, resolveEffectiveOutputSchema } from "../shared/child-launch-plan.ts";
 import { formatRetainedChildren, listRetainedChildren } from "../background/retained-children.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { recordRun } from "../shared/run-history.ts";
@@ -2513,11 +2513,7 @@ function projectEffectiveAcceptanceSchemas(params: SubagentParamsLike, agents: A
 	return {
 		...params,
 		...(params.tasks ? { tasks: params.tasks.map(withEffectiveSchema) } : {}),
-		...(params.chain ? { chain: params.chain.map((step) => {
-			if (isParallelStep(step)) return { ...step, parallel: step.parallel.map(withEffectiveSchema) };
-			if (isDynamicParallelStep(step)) return { ...step, parallel: withEffectiveSchema(step.parallel) };
-			return withEffectiveSchema(step);
-		}) } : {}),
+		...(params.chain ? { chain: projectChainOutputSchemas(params.chain, agents) as ChainStep[] } : {}),
 	};
 }
 
