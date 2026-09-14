@@ -3573,9 +3573,10 @@ export async function runSubagent(
 		timeoutTimer = setTimeout(timeoutRunner, remainingMs);
 		timeoutTimer.unref?.();
 		// Route the pre-deadline checkpoint like any external steer so its lifecycle records the receipt.
-		const checkpointDelayMs = config.checkpointBeforeDeadlineMs === undefined
+		const checkpointBeforeDeadlineMs = config.checkpointBeforeDeadlineMs;
+		const checkpointDelayMs = checkpointBeforeDeadlineMs === undefined || !Number.isInteger(checkpointBeforeDeadlineMs) || checkpointBeforeDeadlineMs <= 0
 			? undefined
-			: remainingMs - config.checkpointBeforeDeadlineMs;
+			: remainingMs - checkpointBeforeDeadlineMs;
 		if (checkpointDelayMs !== undefined && checkpointDelayMs >= 1_000) {
 			const deadlineAt = config.deadlineAt;
 			checkpointTimer = setTimeout(() => {
