@@ -164,7 +164,7 @@ it("native Pi dispatches one child watchdog effect through real SDK lifecycle ev
 	timeout: 30_000,
 }, async () => {
 	const entry = (await import("node:child_process")).execFileSync(process.execPath, ["--input-type=module", "-e", "console.log(import.meta.resolve('@earendil-works/pi-coding-agent'))"], { cwd: sdkRoot, encoding: "utf8" }).trim();
-	assert.match(entry, /\/dist\/index\.js$/);
+	assert.match(entry, /[\\/]dist[\\/]index\.js$/);
 	// SAFETY: The preceding assertion verifies that the resolved module is the SDK dist entrypoint used by this fixture.
 	const pi = await import(entry) as PiModule;
 	const sdkVersion = String(pi.VERSION);

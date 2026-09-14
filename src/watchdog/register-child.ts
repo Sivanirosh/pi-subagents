@@ -79,6 +79,7 @@ export function registerChildWatchdog(
 			ts: Date.now(),
 			...(reason ? { reason } : {}),
 		};
+		if (warning) status.warning = warning;
 		if (effectSettlement) status.effectSettlement = effectSettlement;
 		writeStatus(status);
 	};
