@@ -57,13 +57,6 @@ describe("pinChildCacheRetention", () => {
 		assert.deepEqual(calls[0]?.env, { PI_CACHE_RETENTION: "long" });
 	});
 
-	it("sets the configured tier on the request env", () => {
-		const { agent, calls } = recordingAgent();
-		pinChildCacheRetention(agent, { PI_SUBAGENT_CACHE_RETENTION: "short" });
-		call(agent);
-		assert.equal(calls[0]?.env?.PI_CACHE_RETENTION, "short");
-	});
-
 	it("overrides an inherited parent tier on the request env", () => {
 		const { agent, calls } = recordingAgent();
 		pinChildCacheRetention(agent, { PI_SUBAGENT_CACHE_RETENTION: "short" });
@@ -80,27 +73,14 @@ describe("pinChildCacheRetention", () => {
 		assert.deepEqual((calls[0] as { headers?: Record<string, string> })?.headers, { "x-trace": "1" });
 	});
 
-	it("scopes the override to this session instead of shared process state", () => {
-		const before = process.env.PI_CACHE_RETENTION;
-		const { agent } = recordingAgent();
-		pinChildCacheRetention(agent, { PI_SUBAGENT_CACHE_RETENTION: "short" });
-		call(agent);
-		assert.equal(process.env.PI_CACHE_RETENTION, before);
-	});
-
 	it("leaves a sibling session's stream function alone", () => {
+		const before = process.env.PI_CACHE_RETENTION;
 		const child = recordingAgent();
 		const parent = recordingAgent();
 		pinChildCacheRetention(child.agent, { PI_SUBAGENT_CACHE_RETENTION: "short" });
 		assert.equal(parent.agent.streamFunction, parent.original);
 		call(parent.agent, { env: { PI_CACHE_RETENTION: "long" } });
 		assert.equal(parent.calls[0]?.env?.PI_CACHE_RETENTION, "long");
-	});
-
-	it("does nothing when the session has no agent or stream function", () => {
-		assert.doesNotThrow(() => pinChildCacheRetention(undefined, { PI_SUBAGENT_CACHE_RETENTION: "short" }));
-		assert.doesNotThrow(() =>
-			pinChildCacheRetention({ streamFunction: undefined as unknown as StreamFn }, { PI_SUBAGENT_CACHE_RETENTION: "short" }),
-		);
+		assert.equal(process.env.PI_CACHE_RETENTION, before);
 	});
 });

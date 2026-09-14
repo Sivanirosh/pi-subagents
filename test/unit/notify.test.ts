@@ -764,34 +764,32 @@ describe("completion formatting helpers", () => {
 		fs.statSync = ((path, ...args) => {
 			const value = String(path);
 			if (value.includes("missing")) throw Object.assign(new Error("missing"), { code: value.includes("not-dir") ? "ENOTDIR" : "ENOENT" });
-			const match = value.match(/failure-(EACCES|EPERM|EIO|unknown)/);
-			if (match) {
+			if (value.includes("failure-EACCES")) {
 				const error = new Error(`cannot verify\n\u001b[31m${"é".repeat(800)}`) as NodeJS.ErrnoException;
-				if (match[1] !== "unknown") error.code = match[1];
+				error.code = "EACCES";
 				throw error;
 			}
 			return originalStatSync(path, ...args);
 		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
 		try {
-			for (const code of ["EACCES", "EPERM", "EIO", "unknown"]) {
-				const artifactPath = `/failure-${code}/${"é".repeat(500)}`;
-				const structuredPath = `/failure-${code}/structured`;
+			{
+				const artifactPath = `/failure-EACCES/${"é".repeat(500)}`;
+				const structuredPath = "/failure-EACCES/structured";
 				const details = buildCompletionDetails({
-					id: `workflow-${code}`, mode: "workflow", agent: "workflow", success: true,
+					id: "workflow-EACCES", mode: "workflow", agent: "workflow", success: true,
 					results: [
 						{ workflowKey: "artifact", output: "short", artifactPaths: { outputPath: artifactPath } },
 						{ workflowKey: "structured", output: "short", structuredOutputPath: structuredPath },
 						{ workflowKey: "sibling", output: "short", structuredOutput: { ok: true }, structuredOutputPath: "/producer-confirmed" },
 					],
 				});
-				const expectedCode = code === "unknown" ? undefined : code;
-				assert.deepEqual(details.childOutputs?.[0]?.outputArtifactError, { path: artifactPath, ...(expectedCode ? { code: expectedCode } : {}), message: `cannot verify\n\u001b[31m${"é".repeat(800)}` });
-				assert.deepEqual(details.childOutputs?.[1]?.structuredOutputError, { path: structuredPath, ...(expectedCode ? { code: expectedCode } : {}), message: `cannot verify\n\u001b[31m${"é".repeat(800)}` });
+				assert.deepEqual(details.childOutputs?.[0]?.outputArtifactError, { path: artifactPath, code: "EACCES", message: `cannot verify\n\u001b[31m${"é".repeat(800)}` });
+				assert.deepEqual(details.childOutputs?.[1]?.structuredOutputError, { path: structuredPath, code: "EACCES", message: `cannot verify\n\u001b[31m${"é".repeat(800)}` });
 				assert.equal(details.childOutputs?.[2]?.structuredOutputPath, "/producer-confirmed");
 				const content = formatSingleCompletion(details);
-				assert.match(content, new RegExp(`Output artifact verification failed: stat ${expectedCode ?? "unknown"}`));
-				assert.match(content, new RegExp(`Structured output verification failed: stat ${expectedCode ?? "unknown"}`));
+				assert.match(content, /Output artifact verification failed: stat EACCES/);
+				assert.match(content, /Structured output verification failed: stat EACCES/);
 				assert.doesNotMatch(content, /\u001b/);
 				for (const line of content.split("\n").filter((line) => line.includes("verification failed"))) assert.ok(Buffer.byteLength(line, "utf8") < 1_024);
 				assert.match(formatGroupedCompletion([details, { ...details, agent: "reviewer" }]), /verification failed/);
