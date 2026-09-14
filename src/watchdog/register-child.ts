@@ -141,7 +141,7 @@ export function registerChildWatchdog(
 		observedEffect = undefined;
 		if (!settled) return;
 		const status = runtime.getSnapshot().status;
-		emitStatus(status === "failed" || status === "reviewing" || status === "stale" ? status : "idle", undefined, settled);
+		emitStatus(status === "failed" || status === "reviewing" || status === "stale" ? status : "idle", undefined, undefined, settled);
 	});
 	onRuntimeEvent<ToolExecutionStartEvent>("tool_execution_start", (event) => {
 		// Pi emits this preflight event before tool_call admission. Keep it pending
@@ -172,7 +172,7 @@ export function registerChildWatchdog(
 		if (aborted) {
 			const unresolved = observeUnresolvedEffect();
 			observedEffect = undefined;
-			if (unresolved) emitStatus("idle", undefined, unresolved);
+			if (unresolved) emitStatus("idle", undefined, undefined, unresolved);
 		}
 		emitStatus("reviewing");
 		await runtime.handleAgentEnd(event, ctx);
@@ -187,7 +187,7 @@ export function registerChildWatchdog(
 		observedEffect = undefined;
 		currentContext = undefined;
 		runtime.dispose();
-		emitStatus("idle", undefined, unresolved);
+		emitStatus("idle", undefined, undefined, unresolved);
 	});
 	return runtime;
 }
