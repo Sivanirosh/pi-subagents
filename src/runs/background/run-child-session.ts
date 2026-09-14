@@ -414,8 +414,20 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		};
 
 		const processEvent = (raw: ChildSessionEvent): void => {
-			if (settled) return;
 			const event = raw as ChildSessionEvent & ChildEvent;
+			if (settled) {
+				if (input.childWatchdog && isChildWatchdogStatusEvent(event)) {
+					const watchdogInput: Parameters<typeof acceptChildWatchdogEvent>[0] = { current: childWatchdogState, event };
+					if (input.childEventContext) {
+						watchdogInput.runId = input.childEventContext.runId;
+						watchdogInput.agent = input.childEventContext.agent;
+						watchdogInput.childIndex = input.childEventContext.stepIndex;
+					}
+					const next = acceptChildWatchdogEvent(watchdogInput);
+					if (next) childWatchdogState = next;
+				}
+				return;
+			}
 			appendChildEvent(projectChildSessionEventForJson(raw) as Record<string, unknown>);
 			input.transcriptWriter?.writeChildEvent(projectChildSessionEventForJson(raw) as ChildEvent);
 			if (event.type === "compaction_start") compactionStartedReceived = true;
@@ -439,15 +451,13 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 			if (isChildWatchdogStatusEvent(event)) {
 				if (!input.childWatchdog) return;
-				const next = acceptChildWatchdogEvent({
-					current: childWatchdogState,
-					event,
-					...(input.childEventContext ? {
-						runId: input.childEventContext.runId,
-						agent: input.childEventContext.agent,
-						childIndex: input.childEventContext.stepIndex,
-					} : {}),
-				});
+				const watchdogInput: Parameters<typeof acceptChildWatchdogEvent>[0] = { current: childWatchdogState, event };
+				if (input.childEventContext) {
+					watchdogInput.runId = input.childEventContext.runId;
+					watchdogInput.agent = input.childEventContext.agent;
+					watchdogInput.childIndex = input.childEventContext.stepIndex;
+				}
+				const next = acceptChildWatchdogEvent(watchdogInput);
 				if (!next) return;
 				childWatchdogState = next;
 				input.onChildEvent?.(event);
@@ -558,9 +568,10 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			input.registerTimeout?.(undefined);
 			input.registerStop?.(undefined);
 			input.registerSteer?.(undefined);
-			input.registerWatchdogStatus?.(undefined);
 			unsubscribe?.();
-			return Promise.resolve().then(() => session?.dispose()).catch(() => undefined);
+			return Promise.resolve().then(() => session?.dispose()).catch(() => undefined).then(() => {
+				input.registerWatchdogStatus?.(undefined);
+			});
 		};
 
 		/** The child run ended (or was forced to end); fold in the outcome once the child's shutdown work is done. */

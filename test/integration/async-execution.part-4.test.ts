@@ -504,6 +504,48 @@ setTimeout(() => process.exit(90), 15000).unref();
 		});
 	});
 
+	it("projects child watchdog settlement emitted during background host teardown", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			const id = `async-watchdog-teardown-${Date.now().toString(36)}`;
+			mockPi.onCall({
+				output: "async-done-before-host-teardown",
+				watchdogStatusOnDispose: {
+					...childWatchdogStatus(id, "idle", 2),
+					effectSettlement: {
+						status: "unresolved",
+						toolName: "write",
+						toolCallId: "effect-1",
+						reason: "cancelled-before-tool-return",
+					},
+				},
+			});
+
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Do work",
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+
+			const resultPath = await waitForAsyncResultFile(id, 10_000);
+			// SAFETY: executeAsyncSingle writes this file using the AsyncResultPayload contract exercised by this fixture.
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+			// SAFETY: The successful fixture result includes the watchdog envelope asserted below.
+			assert.deepEqual((payload.results[0] as { watchdog?: { effectSettlement?: unknown } }).watchdog?.effectSettlement, {
+				status: "unresolved",
+				toolName: "write",
+				toolCallId: "effect-1",
+				reason: "cancelled-before-tool-return",
+			});
+		});
+	});
+
 	it("background final-drain waits for child watchdog settlement", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		await withIsolatedWatchdogSettings(tempDir, async () => {
 			writeWatchdogSettings(tempDir);

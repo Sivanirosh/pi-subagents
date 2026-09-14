@@ -4444,6 +4444,34 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		});
 	});
 
+	it("projects child watchdog settlement emitted during foreground host teardown", async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			mockPi.onCall({
+				output: "done-before-host-teardown",
+				watchdogStatusOnDispose: {
+					...childWatchdogStatus("idle", 2),
+					effectSettlement: {
+					status: "unresolved",
+					toolName: "write",
+					toolCallId: "effect-1",
+					reason: "cancelled-before-tool-return",
+				},
+				},
+			});
+
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "watchdog-child-run" });
+
+			assert.equal(result.exitCode, 0);
+			assert.deepEqual(result.watchdog?.effectSettlement, {
+				status: "unresolved",
+				toolName: "write",
+				toolCallId: "effect-1",
+				reason: "cancelled-before-tool-return",
+			});
+		});
+	});
+
 	it("waits for child watchdog settlement before foreground final-drain cleanup", async () => {
 		await withIsolatedWatchdogSettings(tempDir, async () => {
 			writeWatchdogSettings(tempDir);

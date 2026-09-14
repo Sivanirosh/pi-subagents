@@ -15,6 +15,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { DEFAULT_WATCHDOG_CONFIG } from "../../src/watchdog/settings.ts";
 import { createMainWatchdogReview, resolveWatchdogReviewModel } from "../../src/watchdog/review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewRequest } from "../../src/watchdog/runtime.ts";
@@ -63,9 +64,25 @@ function createCtx(input: {
 	authenticated?: string[];
 	thinkingLevel?: string;
 	providerConfig?: { provider: string; api: string; streamSimple: StreamFn };
+	provider?: { provider: string; streamSimple: StreamFn };
 }) {
 	const allModels = input.models ?? (input.current ? [input.current] : []);
 	const authenticated = new Set(input.authenticated ?? allModels.map((entry) => `${entry.provider}/${entry.id}`));
+	const modelRegistry = {
+		getAvailable: () => allModels.filter((entry) => authenticated.has(`${entry.provider}/${entry.id}`)),
+		find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
+		hasConfiguredAuth: (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`),
+		getApiKeyAndHeaders: async (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`)
+			? { ok: true as const, apiKey: `key-${entry.provider}-${entry.id}`, headers: { "x-model": entry.id }, env: { WATCHDOG_PROVIDER: entry.provider } }
+			: { ok: false as const, error: `No auth for ${entry.provider}/${entry.id}` },
+		getRegisteredProviderConfig: (provider: string) => input.providerConfig?.provider === provider ? input.providerConfig : undefined,
+	};
+	if (input.provider) {
+		Object.assign(modelRegistry, {
+			getProvider: (provider: string) => input.provider?.provider === provider ? input.provider : undefined,
+		});
+	}
+	// SAFETY: createCtx intentionally supplies a minimal test context matching the SDK context fields consumed by the review adapter.
 	return {
 		cwd: "/tmp/watchdog-review",
 		model: input.current,
@@ -73,15 +90,7 @@ function createCtx(input: {
 		signal: undefined,
 		sessionManager: { getSessionId: () => "watchdog-review-session" },
 		getSystemPrompt: () => "Parent system prompt",
-		modelRegistry: {
-			getAvailable: () => allModels.filter((entry) => authenticated.has(`${entry.provider}/${entry.id}`)),
-			find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
-			hasConfiguredAuth: (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`),
-			getApiKeyAndHeaders: async (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`)
-				? { ok: true as const, apiKey: `key-${entry.provider}-${entry.id}`, headers: { "x-model": entry.id }, env: { WATCHDOG_PROVIDER: entry.provider } }
-				: { ok: false as const, error: `No auth for ${entry.provider}/${entry.id}` },
-			getRegisteredProviderConfig: (provider: string) => input.providerConfig?.provider === provider ? input.providerConfig : undefined,
-		},
+		modelRegistry,
 	} as never;
 }
 
@@ -513,6 +522,159 @@ describe("main watchdog review adapter", () => {
 		assert.equal(calls[0]?.options?.apiKey, "key-custom-provider-watchdog");
 		assert.equal(calls[0]?.options?.headers?.["x-model"], "watchdog");
 		assert.deepEqual(calls[0]?.options?.env, { WATCHDOG_PROVIDER: "custom-provider" });
+	});
+
+	it("fails closed for a mismatched guarded legacy stream on an old host", async () => {
+		const current = model("legacy-provider", "watchdog", { api: "model-api" });
+		let legacyCalled = false;
+		const ctx = createCtx({ current, providerConfig: {
+			provider: current.provider,
+			api: "registered-api",
+			streamSimple: () => {
+				legacyCalled = true;
+				return responseStream(fauxAssistantMessage("must not run", { stopReason: "stop" }));
+			},
+		} });
+
+		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+		assert.equal(result?.stopReason, "error");
+		assert.equal(legacyCalled, false);
+	});
+
+	it("uses the current provider despite conflicting legacy metadata", async () => {
+		const current = model("native-provider", "watchdog", { api: "native-api" });
+		const calls: string[] = [];
+		const provider = {
+			provider: current.provider,
+			streamSimple: () => {
+				calls.push("current");
+				return responseStream(fauxAssistantMessage("clean", { stopReason: "stop" }));
+			},
+		};
+		const ctx = createCtx({ current, provider, providerConfig: {
+			provider: current.provider,
+			api: "different-api",
+			streamSimple: () => { calls.push("legacy"); return responseStream(fauxAssistantMessage("wrong", { stopReason: "stop" })); },
+		} });
+
+		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+		assert.equal(result?.stopReason, "stop");
+		assert.deepEqual(calls, ["current"]);
+	});
+
+	it("fails closed when modern provider lookup is removed", async () => {
+		const compat = registerFauxProvider({ api: "watchdog-modern-removal-test", provider: "watchdog-compat", models: [{ id: "watchdog", reasoning: false }] });
+		try {
+			compat.setResponses([fauxAssistantMessage("must not run", { stopReason: "stop" })]);
+			const current = model("native-provider", "watchdog", { api: compat.api });
+			let removed = false;
+			const provider = {
+				provider: current.provider,
+				streamSimple: () => {
+					removed = true;
+					return responseStream(fauxAssistantMessage(fauxToolCall("watchdog_warn", {
+						severity: "concern", summary: "Concern", evidence: "Evidence", recommendedAction: "Action",
+					}), { stopReason: "toolUse" }));
+				},
+			};
+			const ctx = createCtx({ current, provider });
+			// SAFETY: createCtx intentionally exposes a mutable test registry so this case can revoke a provider between attempts.
+			const registry = (ctx as any).modelRegistry;
+			registry.getProvider = () => removed ? undefined : provider;
+
+			const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+			assert.equal(result?.stopReason, "error");
+			assert.equal(compat.state.callCount, 0);
+		} finally {
+			compat.unregister();
+		}
+	});
+
+	it("dispatches through the current native provider after replacement", async () => {
+		const current = model("native-provider", "watchdog");
+		const calls: string[] = [];
+		type ProviderWithRole = { role: string; streamSimple: StreamFn };
+		let active!: ProviderWithRole;
+		const replacement = {
+			role: "replacement",
+			streamSimple: function(this: { role: string }, _model: Model<any>, _context: Context) {
+				assert.equal(this.role, "replacement");
+				calls.push("replacement");
+				return responseStream(fauxAssistantMessage("clean", { stopReason: "stop" }));
+			},
+		};
+		const original = {
+			role: "original",
+			streamSimple: function(this: { role: string }, _model: Model<any>, _context: Context) {
+				assert.equal(this.role, "original");
+				calls.push("original");
+				active = replacement;
+				return responseStream(fauxAssistantMessage(fauxToolCall("watchdog_warn", {
+					severity: "concern", summary: "Concern", evidence: "Evidence", recommendedAction: "Action",
+				}), { stopReason: "toolUse" }));
+			},
+		};
+		active = original;
+		const ctx = createCtx({ current, provider: { provider: current.provider, streamSimple: original.streamSimple } });
+		// SAFETY: createCtx intentionally exposes a mutable test registry so this case can replace its provider between attempts.
+		const registry = (ctx as any).modelRegistry;
+		registry.getProvider = () => active;
+
+		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+		assert.equal(result?.stopReason, "stop");
+		assert.deepEqual(calls, ["original", "replacement"]);
+	});
+
+	it("does not fall through after a native provider guard denies dispatch", async () => {
+		const current = model("denied-native", "watchdog");
+		let fallbackCalled = false;
+		const denied = {
+			streamSimple: () => { throw new Error("native provider denied"); },
+		};
+		const fallback = {
+			streamSimple: () => {
+				fallbackCalled = true;
+				return responseStream(fauxAssistantMessage("must not run", { stopReason: "stop" }));
+			},
+		};
+		const ctx = createCtx({
+			current,
+			provider: { provider: current.provider, streamSimple: denied.streamSimple },
+			providerConfig: { provider: current.provider, api: current.api, streamSimple: fallback.streamSimple },
+		});
+
+		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+		assert.equal(result?.stopReason, "error");
+		assert.equal(fallbackCalled, false);
+	});
+
+	it("does not fall through after a native provider returns a denied stream", async () => {
+		const current = model("denied-native-stream", "watchdog");
+		let fallbackCalled = false;
+		const denied = {
+			streamSimple: () => responseStream(fauxAssistantMessage("native provider denied", { stopReason: "error", errorMessage: "native provider denied" })),
+		};
+		const fallback = {
+			streamSimple: () => {
+				fallbackCalled = true;
+				return responseStream(fauxAssistantMessage("must not run", { stopReason: "stop" }));
+			},
+		};
+		const ctx = createCtx({
+			current,
+			provider: { provider: current.provider, streamSimple: denied.streamSimple },
+			providerConfig: { provider: current.provider, api: current.api, streamSimple: fallback.streamSimple },
+		});
+
+		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), []));
+
+		assert.equal(result?.stopReason, "error");
+		assert.equal(fallbackCalled, false);
 	});
 
 	it("falls back to the current session model and thinking when no watchdog model is configured", async () => {

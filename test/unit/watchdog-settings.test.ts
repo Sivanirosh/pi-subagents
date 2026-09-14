@@ -52,6 +52,7 @@ describe("watchdog settings", () => {
 		assert.equal(result.config.clarification, false);
 		assert.equal(result.config.main.enabled, false);
 		assert.equal(result.config.children.enabled, false);
+		assert.equal(result.config.children.blockOnFailure, false);
 		assert.equal(result.config.guidance.watchdogMd, true);
 		assert.equal(result.config.agentEndTimeoutMs, 30_000);
 		assert.equal(result.config.children.watchdogTailTimeoutMs, 120_000);
@@ -59,6 +60,21 @@ describe("watchdog settings", () => {
 		assert.deepEqual(result.config.scope, { enabled: true });
 		assert.deepEqual(result.config.cadence, { everyNTools: null });
 		assert.deepEqual(result.config.lsp, { enabled: true, timeoutMs: 3000, maxFiles: 20, maxDiagnostics: 50 });
+	});
+
+	it("accepts child effect blocking only as an explicit boolean opt-in", () => {
+		const advisory = resolveWatchdogConfig(tempProject, { session: { children: { enabled: true } } });
+		assert.equal(advisory.ok, true);
+		assert.equal(advisory.config.children.blockOnFailure, false);
+
+		const blocking = resolveWatchdogConfig(tempProject, {
+			session: { children: { enabled: true, blockOnFailure: true, overrides: { worker: { blockOnFailure: false } } } },
+		});
+		assert.equal(blocking.ok, true);
+		assert.equal(blocking.config.children.blockOnFailure, true);
+		assert.equal(blocking.config.children.overrides.worker?.blockOnFailure, false);
+		assert.equal(resolveWatchdogConfig(tempProject, { session: { children: { blockOnFailure: "true" } } }).ok, false);
+		assert.equal(resolveWatchdogConfig(tempProject, { session: { children: { overrides: { worker: { blockOnFailure: "true" } } } } }).ok, false);
 	});
 
 	it("accepts only a boolean clarification opt-in", () => {

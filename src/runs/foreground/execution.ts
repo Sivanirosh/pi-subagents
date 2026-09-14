@@ -799,12 +799,12 @@ async function runSingleAttempt(
 			removeAbortListener?.();
 			removeInterruptListener?.();
 			unsubscribe?.();
-			onWatchdogStatus = undefined;
 			void jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
 			// Report the run only after the child's extensions have shut down.
 			void Promise.resolve().then(() => session?.dispose()).catch(() => undefined).then(() => {
+				onWatchdogStatus = undefined;
 				if (session && getReadonlySessionEvidence(session)) settledReadonlySource.set(result, session);
 				resolve(code);
 			});
@@ -997,7 +997,19 @@ async function runSingleAttempt(
 		};
 
 		const processEvent = (evt: ChildSessionEvent & { message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown }) => {
-			if (lifecycleFinished) return;
+			if (lifecycleFinished) {
+				if (childWatchdog && isChildWatchdogStatusEvent(evt)) {
+					const next = acceptChildWatchdogEvent({
+						current: childWatchdogState,
+						event: evt,
+						runId: options.runId,
+						agent: agent.name,
+						childIndex: options.index ?? 0,
+					});
+					if (next) updateChildWatchdogState(next);
+				}
+				return;
+			}
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
 			shared.orcaProgressTab?.event(evt);

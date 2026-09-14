@@ -61,6 +61,15 @@ describe("child watchdog status helpers", () => {
 			assert.throws(() => decodeChildWatchdogConfig(JSON.stringify({ ...payload, fallbackModels: [null] })), /fallbackModels/);
 		}
 	});
+	it("resolves child blocking from override, then children, with advisory default", () => {
+		const base = { ...DEFAULT_WATCHDOG_CONFIG, enabled: true, children: { ...DEFAULT_WATCHDOG_CONFIG.children, enabled: true, overrides: {} } };
+		assert.equal(resolveChildWatchdogConfig({ config: base, agent: "worker" })?.blockOnFailure, false);
+		const children = { ...base, children: { ...base.children, blockOnFailure: true, overrides: { worker: { blockOnFailure: false }, reviewer: { blockOnFailure: true } } } };
+		assert.equal(resolveChildWatchdogConfig({ config: children, agent: "other" })?.blockOnFailure, true);
+		assert.equal(resolveChildWatchdogConfig({ config: children, agent: "worker" })?.blockOnFailure, false);
+		assert.equal(resolveChildWatchdogConfig({ config: children, agent: "reviewer" })?.blockOnFailure, true);
+	});
+
 	it("resolves child cadence from override, then children, then the top-level cadence", () => {
 		const base = { ...DEFAULT_WATCHDOG_CONFIG, enabled: true, children: { ...DEFAULT_WATCHDOG_CONFIG.children, enabled: true, overrides: {} } };
 		assert.deepEqual(resolveChildWatchdogConfig({ config: base, agent: "worker" })?.cadence, { everyNTools: null });
@@ -98,6 +107,7 @@ describe("child watchdog status helpers", () => {
 
 		assert.equal(config?.model, "anthropic/claude-test-worker");
 		assert.equal(config?.thinking, false);
+		assert.equal(config?.blockOnFailure, false);
 		assert.deepEqual(config?.lsp, DEFAULT_WATCHDOG_CONFIG.lsp);
 	});
 
@@ -109,6 +119,7 @@ describe("child watchdog status helpers", () => {
 			watchdogTailTimeoutMs: 100,
 			agentEndTimeoutMs: 200,
 			maxWarnings: null,
+			blockOnFailure: false,
 			lsp: { enabled: false, timeoutMs: 50, maxFiles: 2, maxDiagnostics: 3 },
 			stalemateRepeats: 3,
 			cadence: { everyNTools: 10 },
@@ -129,6 +140,37 @@ describe("child watchdog status helpers", () => {
 			() => decodeChildWatchdogConfig(JSON.stringify({ ...payload, cadence: { everyNTools: 3 } })),
 			/cadence\.everyNTools/,
 		);
+		assert.equal(decodeChildWatchdogConfig(JSON.stringify({ ...payload, blockOnFailure: undefined }))?.blockOnFailure, false);
+		assert.throws(
+			() => decodeChildWatchdogConfig(JSON.stringify({ ...payload, blockOnFailure: "true" })),
+			/blockOnFailure/,
+		);
+	});
+
+	it("rejects malformed effect settlements while preserving omitted settlements", () => {
+		const base = {
+			type: CHILD_WATCHDOG_STATUS_EVENT,
+			seq: 1,
+			phase: "idle",
+			ts: 10,
+		} as const;
+		assert.equal(isChildWatchdogStatusEvent(base), true);
+		assert.equal(isChildWatchdogStatusEvent({ ...base, effectSettlement: { status: "settled", toolName: "write" } }), true);
+		for (const effectSettlement of [
+			{ status: "done", toolName: "write" },
+			{ status: "settled", toolName: "" },
+			{ status: "settled", toolName: "   " },
+			{ status: "settled" },
+			{ status: "settled", toolName: "write", toolCallId: 1 },
+			{ status: "settled", toolName: "write", reason: "unknown" },
+			null,
+		]) {
+			assert.equal(isChildWatchdogStatusEvent({ ...base, effectSettlement }), false, JSON.stringify(effectSettlement));
+		}
+		const accepted = acceptChildWatchdogEvent({ event: { ...base, effectSettlement: { status: "settled", toolName: "write" } }, current: undefined });
+		assert.deepEqual(accepted?.effectSettlement, { status: "settled", toolName: "write" });
+		// SAFETY: This deliberately bypasses static event typing to feed a malformed settlement into the fail-closed validator.
+		assert.equal(acceptChildWatchdogEvent({ event: { ...base, effectSettlement: { status: "done", toolName: "write" } } as never, current: undefined }), undefined);
 	});
 
 	it("accepts latest matching status events and drops stale or foreign events", () => {

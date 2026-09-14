@@ -1,4 +1,11 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentEndEvent,
+	ExtensionAPI,
+	ExtensionContext,
+	ToolExecutionEndEvent,
+	ToolExecutionStartEvent,
+	ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 import { captureWatchdogDiffBaseline, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { MainWatchdogRuntime } from "./runtime.ts";
 import { createMainWatchdogReview } from "./review.ts";
@@ -10,7 +17,7 @@ import {
 	type ChildWatchdogPhase,
 	type ChildWatchdogStatusEvent,
 } from "./child-status.ts";
-import type { ChildWatchdogWarningSummary } from "../shared/types.ts";
+import type { ChildWatchdogEffectSettlement, ChildWatchdogWarningSummary } from "../shared/types.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE, type ResolvedWatchdogConfig, type WatchdogWarningDetails } from "./types.ts";
 
 export function childResolvedConfig(config: ChildWatchdogConfig): ResolvedWatchdogConfig {
@@ -58,9 +65,11 @@ export function registerChildWatchdog(
 	if (!writeStatus) throw new Error("Child watchdog status sink is missing; the host must pass ChildRuntimeConfig.watchdogStatus.");
 	let currentContext: ExtensionContext | undefined;
 	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let observedEffect: { toolCallId?: string; toolName: string; executionEnded: boolean } | undefined;
+	let pendingEffect: { toolCallId?: string; toolName: string } | undefined;
 	let seq = 0;
-	const emitStatus = (phase: ChildWatchdogPhase, reason?: string, warning?: ChildWatchdogWarningSummary): void => {
-		writeStatus({
+	const emitStatus = (phase: ChildWatchdogPhase, reason?: string, warning?: ChildWatchdogWarningSummary, effectSettlement?: ChildWatchdogEffectSettlement): void => {
+		const status: ChildWatchdogStatusEvent = {
 			type: CHILD_WATCHDOG_STATUS_EVENT,
 			...(childConfig.runId ? { runId: childConfig.runId } : {}),
 			...(childConfig.agent ? { agent: childConfig.agent } : {}),
@@ -69,8 +78,26 @@ export function registerChildWatchdog(
 			phase,
 			ts: Date.now(),
 			...(reason ? { reason } : {}),
-			...(warning ? { warning } : {}),
-		});
+		};
+		if (warning) status.warning = warning;
+		if (effectSettlement) status.effectSettlement = effectSettlement;
+		writeStatus(status);
+	};
+	const effectMatches = (event: { toolCallId: string; toolName: string }): boolean => {
+		if (!observedEffect) return false;
+		if (observedEffect.toolCallId) return observedEffect.toolCallId === event.toolCallId;
+		return observedEffect.toolName === event.toolName;
+	};
+	const effectSettlement = (status: ChildWatchdogEffectSettlement["status"], reason?: ChildWatchdogEffectSettlement["reason"]): ChildWatchdogEffectSettlement | undefined => {
+		if (!observedEffect) return undefined;
+		const settlement: ChildWatchdogEffectSettlement = { status, toolName: observedEffect.toolName };
+		if (observedEffect.toolCallId) settlement.toolCallId = observedEffect.toolCallId;
+		if (reason) settlement.reason = reason;
+		return settlement;
+	};
+	const observeUnresolvedEffect = (): ChildWatchdogEffectSettlement | undefined => {
+		const reason = observedEffect?.executionEnded ? "execution-ended-before-tool-return" : "cancelled-before-tool-return";
+		return effectSettlement("unresolved", reason);
 	};
 	const resolved = childResolvedConfig(childConfig);
 	const runtime = new MainWatchdogRuntime({
@@ -92,7 +119,7 @@ export function registerChildWatchdog(
 	const rememberContext = (ctx: ExtensionContext) => {
 		currentContext = ctx;
 	};
-	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => void;
+	const onRuntimeEvent = pi.on as unknown as <T>(event: string, handler: (event: T, ctx: ExtensionContext) => unknown) => void;
 	onRuntimeEvent("session_start", (_event, ctx) => {
 		rememberContext(ctx);
 		diffBaseline = captureWatchdogDiffBaseline(ctx.cwd);
@@ -107,12 +134,47 @@ export function registerChildWatchdog(
 		rememberContext(ctx);
 		runtime.handleTurnEnd(event, ctx);
 	});
-	onRuntimeEvent("tool_result", (_event, ctx) => {
+	onRuntimeEvent<ToolResultEvent>("tool_result", (event, ctx) => {
 		rememberContext(ctx);
 		runtime.handleToolResult(ctx);
+		if (!effectMatches(event)) return;
+		const settled = effectSettlement("settled");
+		observedEffect = undefined;
+		if (!settled) return;
+		const status = runtime.getSnapshot().status;
+		emitStatus(status === "failed" || status === "reviewing" || status === "stale" ? status : "idle", undefined, undefined, settled);
 	});
-	onRuntimeEvent("agent_end", async (event, ctx) => {
+	onRuntimeEvent<ToolExecutionStartEvent>("tool_execution_start", (event) => {
+		// Pi emits this preflight event before tool_call admission. Keep it pending
+		// until the gate allows the matching call, so denied calls cannot occupy the tracker.
+		if (!observedEffect) pendingEffect = { toolName: event.toolName, toolCallId: event.toolCallId };
+	});
+	onRuntimeEvent<ToolExecutionEndEvent>("tool_execution_end", (event) => {
+		if (effectMatches(event) && observedEffect) observedEffect.executionEnded = true;
+	});
+	// This is an admission gate only: Pi checks the synchronous result before
+	// execution, while calls admitted before a later watchdog failure continue.
+	onRuntimeEvent("tool_call", (event: { toolCallId: string }) => {
+		const status = runtime.getSnapshot().status;
+		if (childConfig.blockOnFailure && (status === "failed" || status === "stale")) {
+			if (pendingEffect?.toolCallId === event.toolCallId) pendingEffect = undefined;
+			return { block: true, reason: `Blocked by pi-subagents watchdog: child supervision status is ${status}.` };
+		}
+		if (!observedEffect && pendingEffect?.toolCallId === event.toolCallId) {
+			observedEffect = { ...pendingEffect, executionEnded: false };
+			pendingEffect = undefined;
+		}
+		return undefined;
+	});
+	onRuntimeEvent<AgentEndEvent>("agent_end", async (event, ctx) => {
 		rememberContext(ctx);
+		pendingEffect = undefined;
+		const aborted = ctx.signal?.aborted === true || event.messages.some((message) => "stopReason" in message && message.stopReason === "aborted");
+		if (aborted) {
+			const unresolved = observeUnresolvedEffect();
+			observedEffect = undefined;
+			if (unresolved) emitStatus("idle", undefined, undefined, unresolved);
+		}
 		emitStatus("reviewing");
 		await runtime.handleAgentEnd(event, ctx);
 		const snapshot = runtime.getSnapshot(ctx.cwd);
@@ -121,9 +183,12 @@ export function registerChildWatchdog(
 		else emitStatus("idle");
 	});
 	onRuntimeEvent("session_shutdown", () => {
+		pendingEffect = undefined;
+		const unresolved = observeUnresolvedEffect();
+		observedEffect = undefined;
 		currentContext = undefined;
 		runtime.dispose();
-		emitStatus("idle");
+		emitStatus("idle", undefined, undefined, unresolved);
 	});
 	return runtime;
 }

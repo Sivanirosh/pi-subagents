@@ -8,7 +8,7 @@ import { clearStructuredOutputCaptures } from "../../src/runs/shared/structured-
 import { getAgentDir } from "../../src/shared/utils.ts";
 import { formatChildToolDiagnostic, type ChildToolDiagnostic } from "../../src/runs/shared/tool-availability.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
-import type { ChildWatchdogConfig } from "../../src/watchdog/child-status.ts";
+import type { ChildWatchdogConfig, ChildWatchdogStatusEvent } from "../../src/watchdog/child-status.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../src/watchdog/types.ts";
 import { SUBAGENT_FOREGROUND_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
 import registerSubagentPromptRuntime, {
@@ -107,6 +107,25 @@ function supervisorConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRun
 	});
 }
 
+interface WatchdogHookEvent {
+	toolName?: string;
+	input?: object;
+	type?: string;
+	message?: object;
+	systemPrompt?: string;
+}
+
+interface WatchdogHookContext {
+	cwd?: string;
+	signal?: AbortSignal;
+	model?: object;
+	sessionManager?: object;
+	modelRegistry?: object;
+}
+
+type WatchdogAdmissionResult = { block: boolean; reason?: string };
+interface RecursiveContent { self?: RecursiveContent }
+
 const watchdogConfig: ChildWatchdogConfig = {
 	enabled: true,
 	runId: "run-1",
@@ -115,6 +134,7 @@ const watchdogConfig: ChildWatchdogConfig = {
 	watchdogTailTimeoutMs: 1000,
 	agentEndTimeoutMs: 500,
 	maxWarnings: null,
+	blockOnFailure: false,
 	lsp: { enabled: false, timeoutMs: 3000, maxFiles: 20, maxDiagnostics: 50 },
 	stalemateRepeats: 2,
 	cadence: { everyNTools: null },
@@ -263,6 +283,155 @@ describe("subagent prompt runtime", () => {
 		assert.ok((handlersWith.get("before_agent_start")?.length ?? 0) >= 2);
 		assert.ok((handlersWith.get("turn_end")?.length ?? 0) >= 1);
 		assert.ok((handlersWith.get("agent_end")?.length ?? 0) >= 2, "watchdog and auto-drain both observe agent_end");
+		assert.equal(handlersWith.get("tool_call")?.length ?? 0, 1, "watchdog admission is installed only with child supervision");
+	});
+
+	it("admits healthy effects, denies failed/stale effects before execution, and does not abort admitted work", async () => {
+		type Handler = (event: WatchdogHookEvent, ctx?: WatchdogHookContext) => WatchdogAdmissionResult | undefined | Promise<WatchdogAdmissionResult | undefined>;
+		// Shim limitation: the installed hook is real, but the SDK dispatcher is represented by this event map.
+		const install = (config: ChildWatchdogConfig) => {
+			const handlers = new Map<string, Handler[]>();
+			// SAFETY: This test passes a minimal hook map with the ExtensionAPI surface intentionally omitted.
+			registerSubagentPromptRuntime({
+				on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
+				getThinkingLevel: () => "off",
+				sendMessage: () => {},
+			} as never, childConfig({ childWatchdog: config, watchdogStatus: () => {} }));
+			return handlers;
+		};
+		const ctx = { cwd: process.cwd(), signal: undefined };
+		const failedHandlers = install({ ...watchdogConfig, blockOnFailure: true });
+		const failedToolCall = failedHandlers.get("tool_call")?.[0];
+		assert.ok(failedToolCall);
+		let executed = 0;
+		const healthyDecision = await failedToolCall!({ toolName: "write", input: {} }, ctx);
+		if (!healthyDecision?.block) executed++;
+		assert.equal(healthyDecision, undefined);
+		const admittedDecision = failedToolCall!({ toolName: "write", input: {} }, ctx);
+		assert.equal(admittedDecision, undefined);
+		const inFlight = new Promise<void>((resolve) => setTimeout(() => { executed++; resolve(); }, 5));
+		const recursive: RecursiveContent = {};
+		recursive.self = recursive;
+		failedHandlers.get("turn_end")?.[0]?.({ type: "turn_end", message: { role: "toolResult", toolName: "write", content: recursive } }, ctx);
+		const failedDecision = await failedToolCall!({ toolName: "write", input: {} }, ctx);
+		assert.deepEqual(failedDecision, { block: true, reason: "Blocked by pi-subagents watchdog: child supervision status is failed." });
+		assert.equal(executed, 1, "a denied call is not executed");
+		await inFlight;
+		assert.equal(executed, 2, "an already-admitted call completes after failure");
+
+		const advisoryHandlers = install(watchdogConfig);
+		const advisoryToolCall = advisoryHandlers.get("tool_call")?.[0];
+		assert.ok(advisoryToolCall);
+		advisoryHandlers.get("turn_end")?.[0]?.({ type: "turn_end", message: { role: "toolResult", toolName: "write", content: recursive } }, ctx);
+		assert.equal(await advisoryToolCall!({ toolName: "write", input: {} }, ctx), undefined, "advisory status does not deny a new call");
+
+		const model = { provider: "test", id: "watchdog", name: "watchdog", api: "faux", baseUrl: "https://example.invalid", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 4_096 };
+		const { handlers: staleHandlers, statusEvents } = installWatchdogRegistration({ ...watchdogConfig, blockOnFailure: true, agentEndTimeoutMs: 5, cadence: { everyNTools: 5 } });
+		const staleCtx = {
+			cwd: process.cwd(), signal: undefined, model,
+			sessionManager: { getSessionId: () => "stale-gate" },
+			modelRegistry: { getAvailable: () => [model], getApiKeyAndHeaders: async () => new Promise(() => undefined) },
+		};
+		await staleHandlers.get("session_start")?.[0]?.({}, staleCtx);
+		await staleHandlers.get("before_agent_start")?.[0]?.({ systemPrompt: "task" }, staleCtx);
+		staleHandlers.get("turn_end")?.[0]?.({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "work" }] } }, staleCtx);
+		for (let i = 0; i < 5; i++) staleHandlers.get("tool_result")?.[0]?.({ type: "tool_result", toolName: "write", content: [{ type: "text", text: "started" }] }, staleCtx);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const staleDecision = await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "denied-effect", toolName: "write", input: {} }, staleCtx);
+		assert.deepEqual(staleDecision, { block: true, reason: "Blocked by pi-subagents watchdog: child supervision status is stale." });
+
+		// Pi emits execution_start before tool_call. A denied preflight must not
+		// become the effect reported after the next session admission.
+		staleHandlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "denied-effect", toolName: "write", args: {} }, staleCtx);
+		const deniedEffect = await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "denied-effect", toolName: "write", input: {} }, staleCtx);
+		assert.deepEqual(deniedEffect, { block: true, reason: "Blocked by pi-subagents watchdog: child supervision status is stale." });
+		await staleHandlers.get("session_start")?.[0]?.({}, staleCtx);
+		staleHandlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "admitted-effect", toolName: "write", args: {} }, staleCtx);
+		assert.equal(await staleHandlers.get("tool_call")?.[0]?.({ toolCallId: "admitted-effect", toolName: "write", input: {} }, staleCtx), undefined);
+		staleHandlers.get("tool_result")?.[0]?.({ type: "tool_result", toolCallId: "admitted-effect", toolName: "write", content: [], isError: false }, staleCtx);
+		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
+			status: "settled",
+			toolName: "write",
+			toolCallId: "admitted-effect",
+		});
+	});
+
+	const installWatchdogRegistration = (config: ChildWatchdogConfig = watchdogConfig) => {
+		type RegistrationHandler = (event?: WatchdogHookEvent, ctx?: WatchdogHookContext) => WatchdogAdmissionResult | undefined | Promise<WatchdogAdmissionResult | undefined>;
+		const handlers = new Map<string, RegistrationHandler[]>();
+		const statusEvents: ChildWatchdogStatusEvent[] = [];
+		// SAFETY: This test passes a minimal hook map with the ExtensionAPI surface intentionally omitted.
+		registerSubagentPromptRuntime({
+			on(event: string, handler: RegistrationHandler) {
+				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+			},
+			getThinkingLevel: () => "off",
+			sendMessage: () => {},
+		} as never, childConfig({ childWatchdog: config, watchdogStatus: (event) => statusEvents.push(event) }));
+		return { handlers, statusEvents };
+	};
+
+	it("observes one returned child effect through the real extension hook seam", async () => {
+		const { handlers, statusEvents } = installWatchdogRegistration();
+		const ctx = { cwd: process.cwd(), signal: undefined };
+		await handlers.get("session_start")?.[0]?.({}, ctx);
+		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-1", toolName: "write", args: { path: "out.txt" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-1", toolName: "write", input: {} }, ctx), undefined);
+		handlers.get("tool_result")?.[0]?.({ type: "tool_result", toolCallId: "effect-1", toolName: "write", content: [], isError: false }, ctx);
+		handlers.get("tool_execution_end")?.[0]?.({ type: "tool_execution_end", toolCallId: "effect-1", toolName: "write", result: {}, isError: false }, ctx);
+		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
+			status: "settled",
+			toolName: "write",
+			toolCallId: "effect-1",
+		});
+	});
+
+	it("reports a child effect unresolved when shutdown cancels it before a tool return", async () => {
+		const { handlers, statusEvents } = installWatchdogRegistration();
+		const ctx = { cwd: process.cwd(), signal: undefined };
+		await handlers.get("session_start")?.[0]?.({}, ctx);
+		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-2", toolName: "bash", args: { command: "long-running" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-2", toolName: "bash", input: {} }, ctx), undefined);
+		await handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown", reason: "quit" }, ctx);
+		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
+			status: "unresolved",
+			toolName: "bash",
+			toolCallId: "effect-2",
+			reason: "cancelled-before-tool-return",
+		});
+	});
+
+	it("reports a child effect unresolved when abort ends the run before a tool return", async () => {
+		const { handlers, statusEvents } = installWatchdogRegistration();
+		const ctx = { cwd: process.cwd(), signal: undefined };
+		await handlers.get("session_start")?.[0]?.({}, ctx);
+		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-abort", toolName: "bash", args: { command: "long-running" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-abort", toolName: "bash", input: {} }, ctx), undefined);
+		const controller = new AbortController();
+		controller.abort();
+		await handlers.get("agent_end")?.[0]?.({ type: "agent_end", messages: [{ stopReason: "aborted" }] }, { ...ctx, signal: controller.signal });
+		assert.ok(statusEvents.some((event) => JSON.stringify(event.effectSettlement) === JSON.stringify({
+			status: "unresolved",
+			toolName: "bash",
+			toolCallId: "effect-abort",
+			reason: "cancelled-before-tool-return",
+		})));
+	});
+
+	it("reports a child effect unresolved when execution ends before a tool return", async () => {
+		const { handlers, statusEvents } = installWatchdogRegistration();
+		const ctx = { cwd: process.cwd(), signal: undefined };
+		await handlers.get("session_start")?.[0]?.({}, ctx);
+		handlers.get("tool_execution_start")?.[0]?.({ type: "tool_execution_start", toolCallId: "effect-3", toolName: "edit", args: { path: "out.txt" } }, ctx);
+		assert.equal(await handlers.get("tool_call")?.[0]?.({ toolCallId: "effect-3", toolName: "edit", input: {} }, ctx), undefined);
+		handlers.get("tool_execution_end")?.[0]?.({ type: "tool_execution_end", toolCallId: "effect-3", toolName: "edit", result: {}, isError: false }, ctx);
+		await handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown", reason: "quit" }, ctx);
+		assert.deepEqual(statusEvents.at(-1)?.effectSettlement, {
+			status: "unresolved",
+			toolName: "edit",
+			toolCallId: "effect-3",
+			reason: "execution-ended-before-tool-return",
+		});
 	});
 
 	it("registered structured_output tool accepts valid schema output and captures it", async () => {

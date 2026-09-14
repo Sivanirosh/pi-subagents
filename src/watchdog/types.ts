@@ -93,6 +93,8 @@ export interface WatchdogEndpointConfig {
 
 export interface WatchdogChildOverrideConfig {
 	enabled?: boolean;
+	/** Deny new child tool calls after a failed or stale watchdog status. */
+	blockOnFailure?: boolean;
 	model?: string;
 	fallbackModels?: string[];
 	thinking?: string | false;
@@ -101,6 +103,8 @@ export interface WatchdogChildOverrideConfig {
 
 export interface WatchdogChildrenConfig extends WatchdogEndpointConfig {
 	watchdogTailTimeoutMs: number;
+	/** Child tool calls remain advisory unless this opt-in is true. */
+	blockOnFailure: boolean;
 	/** Mid-run cadence for child watchdogs; defaults to the top-level cadence. */
 	cadence?: Partial<WatchdogCadenceConfig>;
 	overrides: Record<string, WatchdogChildOverrideConfig>;
