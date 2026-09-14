@@ -924,6 +924,13 @@ export interface ChildWatchdogWarningSummary extends Pick<WatchdogWarningDetails
 	stalemate: boolean;
 }
 
+export interface ChildWatchdogEffectSettlement {
+	status: "settled" | "unresolved";
+	toolName: string;
+	toolCallId?: string;
+	reason?: "execution-ended-before-tool-return" | "cancelled-before-tool-return";
+}
+
 export interface ChildWatchdogProgress {
 	phase: "idle" | "reviewing" | "stale" | "failed";
 	seq: number;
@@ -931,6 +938,7 @@ export interface ChildWatchdogProgress {
 	reason?: string;
 	timedOut?: boolean;
 	warnings?: ChildWatchdogWarningSummary[];
+	effectSettlement?: ChildWatchdogEffectSettlement;
 }
 
 export interface AgentProgress {

@@ -81,6 +81,7 @@ export const DEFAULT_WATCHDOG_CONFIG: ResolvedWatchdogConfig = {
 	children: {
 		enabled: false,
 		watchdogTailTimeoutMs: 120_000,
+		blockOnFailure: false,
 		overrides: {},
 	},
 	lsp: {
@@ -112,8 +113,8 @@ const GUIDANCE_FIELDS = new Set(["watchdogMd"]);
 const SCOPE_FIELDS = new Set(["enabled"]);
 const CADENCE_FIELDS = new Set(["everyNTools"]);
 const ENDPOINT_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking"]);
-const CHILDREN_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking", "watchdogTailTimeoutMs", "cadence", "overrides"]);
-const CHILD_OVERRIDE_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking", "cadence"]);
+const CHILDREN_FIELDS = new Set(["enabled", "model", "fallbackModels", "thinking", "watchdogTailTimeoutMs", "blockOnFailure", "cadence", "overrides"]);
+const CHILD_OVERRIDE_FIELDS = new Set(["enabled", "blockOnFailure", "model", "fallbackModels", "thinking", "cadence"]);
 const LSP_FIELDS = new Set(["enabled", "timeoutMs", "maxFiles", "maxDiagnostics"]);
 
 function cloneDefaultConfig(): ResolvedWatchdogConfig {
@@ -234,6 +235,7 @@ function parseChildOverridePatch(value: unknown, field: string, meta: ParseMeta)
 	const patch: WatchdogChildOverridePatch = {};
 	if ("fallbackModels" in input) patch.fallbackModels = parseStringList(input.fallbackModels, `${field}.fallbackModels`, meta);
 	if ("enabled" in input) patch.enabled = parseBoolean(input.enabled, `${field}.enabled`, meta);
+	if ("blockOnFailure" in input) patch.blockOnFailure = parseBoolean(input.blockOnFailure, `${field}.blockOnFailure`, meta);
 	if ("model" in input) patch.model = parseNonEmptyString(input.model, `${field}.model`, meta);
 	if ("thinking" in input) patch.thinking = parseThinking(input.thinking, `${field}.thinking`, meta);
 	if ("cadence" in input) patch.cadence = parseCadencePatch(input.cadence, `${field}.cadence`, meta);
@@ -246,6 +248,7 @@ function parseChildrenPatch(value: unknown, field: string, meta: ParseMeta): Wat
 	const patch: WatchdogChildrenPatch = {};
 	if ("fallbackModels" in input) patch.fallbackModels = parseStringList(input.fallbackModels, `${field}.fallbackModels`, meta);
 	if ("enabled" in input) patch.enabled = parseBoolean(input.enabled, `${field}.enabled`, meta);
+	if ("blockOnFailure" in input) patch.blockOnFailure = parseBoolean(input.blockOnFailure, `${field}.blockOnFailure`, meta);
 	if ("model" in input) patch.model = parseNonEmptyString(input.model, `${field}.model`, meta);
 	if ("thinking" in input) patch.thinking = parseThinking(input.thinking, `${field}.thinking`, meta);
 	if ("watchdogTailTimeoutMs" in input) {

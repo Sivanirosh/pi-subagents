@@ -1,7 +1,7 @@
 import { Agent, type AgentTool, type StreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createReadOnlyTools, convertToLlm, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
-import type { Model, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { Context, Model, ProviderHeaders, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { buildModelCandidates, isContextOverflow, isRetryableModelFailureAttempt, resolveModelCandidate } from "../runs/shared/model-fallback.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
@@ -250,6 +250,32 @@ function resolveContext(provider: WatchdogContextProvider): ExtensionContext | u
 	return typeof provider === "function" ? provider() : provider;
 }
 
+type WatchdogModelRegistry = Omit<ExtensionContext["modelRegistry"], "getProvider" | "getRegisteredProviderConfig"> & {
+	getProvider?: (provider: string) => { streamSimple: StreamFn } | undefined;
+	getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
+};
+
+/** Resolve the provider at dispatch time so replacement and revocation stay guarded. */
+function dispatchWatchdogStream(
+	registry: WatchdogModelRegistry,
+	model: RegistryModel,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+): ReturnType<StreamFn> {
+	const currentProvider = registry.getProvider?.(model.provider);
+	if (registry.getProvider) {
+		if (!currentProvider) throw new Error(`Watchdog provider '${model.provider}' is no longer available.`);
+		return currentProvider.streamSimple(model, context, options);
+	}
+
+	const registered = registry.getRegisteredProviderConfig?.(model.provider);
+	if (registered?.streamSimple) {
+		if (registered.api !== model.api) throw new Error(`Watchdog legacy provider '${model.provider}' rejected model API '${model.api}'.`);
+		return registered.streamSimple(model, context, options);
+	}
+	return streamSimple(model, context, options);
+}
+
 export function createMainWatchdogReview(provider: WatchdogContextProvider, options: CreateMainWatchdogReviewOptions = {}): WatchdogReviewFunction {
 	return async (request) => {
 		const ctx = resolveContext(provider);
@@ -288,23 +314,22 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 	});
 	if (ctx.signal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
 	const auth = selection.auth;
-	const registeredProvider = (ctx.modelRegistry as {
-		getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
-	}).getRegisteredProviderConfig?.(selection.model.provider);
-	const baseStreamFn = options.streamFn ?? (registeredProvider?.streamSimple && registeredProvider.api === selection.model.api
-		? registeredProvider.streamSimple
-		: streamSimple);
+	// SAFETY: Pi supplies this model registry; the named view adds only optional provider lookup hooks used by this adapter.
+	const registry = ctx.modelRegistry as WatchdogModelRegistry;
 	const sessionId = ctx.sessionManager.getSessionId();
 	const streamFn: StreamFn = (model, context, streamOptions) => {
 		// Agent may enter one final loop iteration after an aborted mixed tool batch.
 		// Never send that iteration to the provider after an intentional yield.
 		if (clarification) throw new Error("Watchdog review yielded for clarification.");
-		return baseStreamFn(model, context, {
+		const requestOptions = {
 			...streamOptions,
 			...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 			env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
 			headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
-		});
+		};
+		return options.streamFn
+			? options.streamFn(model, context, requestOptions)
+			: dispatchWatchdogStream(registry, model, context, requestOptions);
 	};
 	const diffBaseline = options.diffBaseline?.();
 	let clarification: { question: string; evidence: string } | undefined;

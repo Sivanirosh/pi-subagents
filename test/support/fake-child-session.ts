@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ChildSession, ChildSessionEvent, ChildSessionFactory, ChildSessionLaunch } from "../../src/runs/shared/child-session.ts";
-import { isChildWatchdogStatusEvent } from "../../src/watchdog/child-status.ts";
+import { isChildWatchdogStatusEvent, type ChildWatchdogStatusEvent } from "../../src/watchdog/child-status.ts";
 
 export interface FakeChildResponse {
 	output?: string;
@@ -42,6 +42,8 @@ export interface FakeChildResponse {
 	createError?: string;
 	/** Keeps the run open until the parent aborts it. */
 	hangUntilAbort?: boolean;
+	/** Child watchdog status emitted by the session's dispose hook. */
+	watchdogStatusOnDispose?: ChildWatchdogStatusEvent;
 	/** After draining a post-final steer/follow-up into pending (hasQueuedMessages false), delay before `turn_start`. */
 	queuedMessageTurnStartDelayMs?: number;
 	/** Assistant text emitted for that delayed queued-message turn. */
@@ -223,6 +225,7 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			let boundaryOpen = false;
 			const model = reportedModel(launch.model);
 			let abortResolve: (() => void) | undefined;
+			let watchdogStatusOnDispose: ChildWatchdogStatusEvent | undefined;
 			const abortedPromise = new Promise<void>((resolve) => { abortResolve = resolve; });
 			const sessionId = randomUUID();
 			let sessionFile: string | undefined;
@@ -329,6 +332,7 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				}
 			};
 			const runScript = async (response: FakeChildResponse, task: string): Promise<void> => {
+				watchdogStatusOnDispose = response.watchdogStatusOnDispose;
 				if (typeof response.delay === "number" && response.delay > 0) await sleep(response.delay, abortedPromise);
 				await waitForReleasePath(response.waitForPath);
 				if (record.aborted) return;
@@ -496,6 +500,7 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				},
 				async dispose() {
 					record.disposed = true;
+					if (watchdogStatusOnDispose !== undefined) launch.runtime.watchdogStatus?.(watchdogStatusOnDispose);
 				},
 				get messages() { return messages; },
 				get sessionFile() { return sessionFile; },

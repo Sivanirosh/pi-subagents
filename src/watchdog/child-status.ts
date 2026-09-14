@@ -1,4 +1,4 @@
-import type { ChildWatchdogProgress, ChildWatchdogWarningSummary } from "../shared/types.ts";
+import type { ChildWatchdogEffectSettlement, ChildWatchdogProgress, ChildWatchdogWarningSummary } from "../shared/types.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE, type ResolvedWatchdogConfig, type WatchdogCadenceConfig, type WatchdogCategory, type WatchdogLspConfig } from "./types.ts";
 
 export const CHILD_WATCHDOG_WARNING_LIMIT = 20;
@@ -18,6 +18,8 @@ export interface ChildWatchdogConfig {
 	model?: string;
 	fallbackModels?: string[];
 	thinking?: string | false;
+	/** Deny new tool calls after a failed or stale status when true. */
+	blockOnFailure: boolean;
 	lsp: WatchdogLspConfig;
 	stalemateRepeats: number;
 	/** Mid-run review cadence; everyNTools null means boundary reviews only. */
@@ -34,6 +36,7 @@ export interface ChildWatchdogStatusEvent {
 	phase: ChildWatchdogPhase;
 	ts: number;
 	reason?: string;
+	effectSettlement?: ChildWatchdogEffectSettlement;
 }
 
 export type ChildWatchdogStateSnapshot = ChildWatchdogProgress;
@@ -50,6 +53,7 @@ export function resolveChildWatchdogConfig(input: {
 	const model = override?.model ?? input.config.children.model;
 	const fallbackModels = override?.fallbackModels ?? input.config.children.fallbackModels;
 	const thinking = override?.thinking ?? input.config.children.thinking;
+	const blockOnFailure = override?.blockOnFailure ?? input.config.children.blockOnFailure;
 	const cadence = override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
 	return {
 		...(input.runId ? { runId: input.runId } : {}),
@@ -61,6 +65,7 @@ export function resolveChildWatchdogConfig(input: {
 		...(model ? { model } : {}),
 		...(fallbackModels !== undefined ? { fallbackModels: [...fallbackModels] } : {}),
 		...(thinking !== undefined ? { thinking } : {}),
+		blockOnFailure,
 		lsp: { ...input.config.lsp },
 		stalemateRepeats: input.config.stalemateRepeats,
 		cadence: { everyNTools: cadence.everyNTools ?? null },
@@ -144,6 +149,9 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 	if (fallbackModels !== undefined && (!Array.isArray(fallbackModels) || fallbackModels.some((value) => typeof value !== "string" || !value.trim()))) {
 		throw new Error("Invalid child watchdog config: fallbackModels must be an array of non-empty strings.");
 	}
+	if ("blockOnFailure" in parsed && parsed.blockOnFailure !== true && parsed.blockOnFailure !== false) {
+		throw new Error("Invalid child watchdog config: blockOnFailure must be a boolean.");
+	}
 	return {
 		...(runId ? { runId } : {}),
 		...(agent ? { agent } : {}),
@@ -154,6 +162,7 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 		...(model ? { model } : {}),
 		...(fallbackModels !== undefined ? { fallbackModels: (fallbackModels as string[]).map((value) => value.trim()) } : {}),
 		...(thinking !== undefined ? { thinking: thinking as string | false } : {}),
+		blockOnFailure: parsed.blockOnFailure === true,
 		lsp: childConfigLsp(parsed.lsp),
 		stalemateRepeats: childConfigPositiveInteger(parsed, "stalemateRepeats"),
 		cadence: childConfigCadence(parsed.cadence),
@@ -195,6 +204,7 @@ export function acceptChildWatchdogEvent(input: {
 		seq: input.event.seq,
 		lastUpdate: input.event.ts,
 		...(input.event.reason ? { reason: input.event.reason } : {}),
+		...(input.event.effectSettlement ? { effectSettlement: input.event.effectSettlement } : input.current?.effectSettlement ? { effectSettlement: input.current.effectSettlement } : {}),
 		...(input.current?.warnings?.length ? { warnings: input.current.warnings } : {}),
 	};
 }

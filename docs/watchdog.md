@@ -142,6 +142,26 @@ Reviews retain the existing `agentEndTimeoutMs`. Questions and evidence are capp
 
 Opt in under `subagents.watchdog.children`. `model`, `fallbackModels`, and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `fallbackModels`, `thinking`, `enabled`, or `cadence` per role.
 
+Child watchdog status is advisory by default. Failed or stale status does not block a child tool call. Set `children.blockOnFailure` to `true` to deny new child tool calls while the child watchdog status is failed or stale. An override can set `children.overrides.<agent>.blockOnFailure` for one agent.
+
+```json
+{
+  "subagents": {
+    "watchdog": {
+      "children": {
+        "enabled": true,
+        "blockOnFailure": true,
+        "overrides": {
+          "reviewer": { "blockOnFailure": false }
+        }
+      }
+    }
+  }
+}
+```
+
+The gate applies before tool execution. It does not cancel a tool call that was already admitted. It does not pause the whole run or settle sibling processes. A child watchdog still reports only the observed child status.
+
 ## Launch rules
 
 `subagents.watchdog.rules` pins which models each role may run on. It runs before a child starts, needs no model call, and applies even when model review is off.
