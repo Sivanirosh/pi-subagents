@@ -119,6 +119,7 @@ export async function discoverBridgeManifest(machine: HerdrMachineReference, run
 	const script = `p="$1/manifest.json"; test -f "$p" && test ! -L "$p" && cat "$p"`;
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const result = await runHerdrRemoteCommandAsync(machine, remoteShellCommand(script, [runtimeDir]), { ...options, timeout: 5_000, maxBuffer: 64 * 1024 });
+		if (result.error) throw new Error(`Remote bridge manifest discovery failed: ${result.error.message}`, { cause: result.error });
 		if (result.status === 0 && result.stdout.trim()) {
 			let value: unknown; try { value = JSON.parse(result.stdout) as unknown; } catch { throw new Error("Remote bridge manifest is malformed."); }
 			const p = value as Record<string, unknown>;
@@ -130,7 +131,7 @@ export async function discoverBridgeManifest(machine: HerdrMachineReference, run
 	throw new Error("The remote Pi did not expose the packaged pi-subagents bridge. Install/configure the same package version as an ambient Pi extension on the saved machine.");
 }
 
-export async function createRemoteRuntimeDir(machine: HerdrMachineReference, runId: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> { const result = await runHerdrRemoteCommandAsync(machine, remoteShellCommand("umask 077; mktemp -d \"${TMPDIR:-/tmp}/pi-subagents-herdr-$1-XXXXXXXX\"", [runId]), { ...options, timeout: 10_000, maxBuffer: 4096 }); const value = result.stdout.trim(); if (result.status !== 0 || !path.posix.isAbsolute(value) || value.includes("\n")) throw new Error("Could not provision a run-private remote bridge runtime directory."); return value; }
+export async function createRemoteRuntimeDir(machine: HerdrMachineReference, runId: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> { const result = await runHerdrRemoteCommandAsync(machine, remoteShellCommand("umask 077; mktemp -d \"${TMPDIR:-/tmp}/pi-subagents-herdr-$1-XXXXXXXX\"", [runId]), { ...options, timeout: 10_000, maxBuffer: 4096 }); if (result.error) throw new Error(`Could not provision a run-private remote bridge runtime directory: ${result.error.message}`, { cause: result.error }); const value = result.stdout.trim(); if (result.status !== 0 || !path.posix.isAbsolute(value) || value.includes("\n")) throw new Error("Could not provision a run-private remote bridge runtime directory."); return value; }
 export function removeRemoteRuntimeDir(machine: HerdrMachineReference, runtimeDir: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): void { const result = runHerdrRemoteCommand(machine, remoteShellCommand("p=$1; case \"${p##*/}\" in pi-subagents-herdr-*) test -d \"$p\" && test ! -L \"$p\" && rm -rf -- \"$p\";; *) exit 64;; esac", [runtimeDir]), { ...options, timeout: 10_000, maxBuffer: 4096 }); if (result.status !== 0 || result.stdout) throw new Error(`Could not remove the exact owned remote runtime directory: ${String(result.stderr).slice(0, 512)}`); }
 
 /** The single private owner for allocation shared by every pane-native backend projection. */
