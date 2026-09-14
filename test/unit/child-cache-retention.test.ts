@@ -50,6 +50,7 @@ describe("childCacheRetentionEnv", () => {
 
 describe("pinChildCacheRetention", () => {
 	it("leaves the stream function untouched when no tier is configured", () => {
+		assert.doesNotThrow(() => { pinChildCacheRetention(undefined, {}); pinChildCacheRetention({ streamFunction: undefined as unknown as StreamFn }, {}); });
 		const { agent, calls, original } = recordingAgent();
 		pinChildCacheRetention(agent, {});
 		assert.equal(agent.streamFunction, original);

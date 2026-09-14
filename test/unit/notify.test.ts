@@ -763,6 +763,7 @@ describe("completion formatting helpers", () => {
 		const originalStatSync = fs.statSync;
 		fs.statSync = ((path, ...args) => {
 			const value = String(path);
+			if (value.includes("failure-unknown")) throw new Error("cannot verify");
 			if (value.includes("missing")) throw Object.assign(new Error("missing"), { code: value.includes("not-dir") ? "ENOTDIR" : "ENOENT" });
 			if (value.includes("failure-EACCES")) {
 				const error = new Error(`cannot verify\n\u001b[31m${"é".repeat(800)}`) as NodeJS.ErrnoException;
@@ -794,6 +795,7 @@ describe("completion formatting helpers", () => {
 				for (const line of content.split("\n").filter((line) => line.includes("verification failed"))) assert.ok(Buffer.byteLength(line, "utf8") < 1_024);
 				assert.match(formatGroupedCompletion([details, { ...details, agent: "reviewer" }]), /verification failed/);
 				assert.match(parseSubagentNotifyContent(content)?.resultPreview ?? "", /verification failed/);
+				assert.match(formatSingleCompletion(buildCompletionDetails({ id: "workflow-unknown", mode: "workflow", agent: "workflow", success: true, results: [{ workflowKey: "artifact", output: "short", artifactPaths: { outputPath: "/failure-unknown/artifact" } }] })), /Output artifact verification failed: stat unknown/);
 			}
 
 			const unavailable = buildCompletionDetails({ id: "workflow-missing", mode: "workflow", agent: "workflow", success: true, results: [
