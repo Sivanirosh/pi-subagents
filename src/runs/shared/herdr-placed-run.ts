@@ -7,7 +7,7 @@ import packageJson from "../../../package.json" with { type: "json" };
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 import type { ChildSession, ChildSessionEvent, ChildSessionFactory, ChildSessionLaunch } from "./child-session.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
-import { connectHerdrMachine, remoteShellCommand, runHerdrRemoteCommand, type HerdrForwardedConnection, type HerdrRpcClient } from "./herdr-connection.ts";
+import { connectHerdrMachine, remoteShellCommand, runHerdrRemoteCommand, runHerdrRemoteCommandAsync, type HerdrForwardedConnection, type HerdrRpcClient } from "./herdr-connection.ts";
 import { encodeHerdrPiFrame, HERDR_PI_MODE_ENV, HERDR_PI_PROTOCOL, HERDR_PI_RUN_ENV, HERDR_PI_RUNTIME_DIR_ENV, HerdrPiFrameDecoder, validateHerdrPiRunId, type HerdrPiFrame } from "./herdr-pi-protocol.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 
@@ -129,6 +129,21 @@ export function discoverBridgeManifest(machine: HerdrMachineReference, runId: st
 	throw new Error("The remote Pi did not expose the packaged pi-subagents bridge. Install/configure the same package version as an ambient Pi extension on the saved machine.");
 }
 
+async function discoverBridgeManifestAsync(machine: HerdrMachineReference, runId: string, runtimeDir: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{ socketPath: string; nativeSessionId: string; packageVersion: string; protocol: number }> {
+	const script = `p="$1/manifest.json"; test -f "$p" && test ! -L "$p" && cat "$p"`;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const result = await runHerdrRemoteCommandAsync(machine, remoteShellCommand(script, [runtimeDir]), { ...options, timeout: 5_000, maxBuffer: 64 * 1024 });
+		if (result.status === 0 && result.stdout.trim()) {
+			let value: unknown; try { value = JSON.parse(result.stdout) as unknown; } catch { throw new Error("Remote bridge manifest is malformed."); }
+			const p = value as Record<string, unknown>;
+			if (p.runId !== runId || typeof p.socketPath !== "string" || path.posix.dirname(p.socketPath) !== runtimeDir || typeof p.nativeSessionId !== "string" || typeof p.packageVersion !== "string" || typeof p.protocol !== "number") throw new Error("Remote bridge manifest identity is incomplete or outside its owned runtime directory.");
+			return p as unknown as { socketPath: string; nativeSessionId: string; packageVersion: string; protocol: number };
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	throw new Error("The remote Pi did not expose the packaged pi-subagents bridge. Install/configure the same package version as an ambient Pi extension on the saved machine.");
+}
+
 export function createRemoteRuntimeDir(machine: HerdrMachineReference, runId: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): string { const result = runHerdrRemoteCommand(machine, remoteShellCommand("umask 077; mktemp -d \"${TMPDIR:-/tmp}/pi-subagents-herdr-$1-XXXXXXXX\"", [runId]), { ...options, timeout: 10_000, maxBuffer: 4096 }); const value = result.stdout.trim(); if (result.status !== 0 || !path.posix.isAbsolute(value) || value.includes("\n")) throw new Error("Could not provision a run-private remote bridge runtime directory."); return value; }
 export function removeRemoteRuntimeDir(machine: HerdrMachineReference, runtimeDir: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): void { const result = runHerdrRemoteCommand(machine, remoteShellCommand("p=$1; case \"${p##*/}\" in pi-subagents-herdr-*) test -d \"$p\" && test ! -L \"$p\" && rm -rf -- \"$p\";; *) exit 64;; esac", [runtimeDir]), { ...options, timeout: 10_000, maxBuffer: 4096 }); if (result.status !== 0 || result.stdout) throw new Error(`Could not remove the exact owned remote runtime directory: ${String(result.stderr).slice(0, 512)}`); }
 
@@ -214,14 +229,14 @@ export class HerdrPiSession implements ChildSession {
 }
 
 export async function reconnectHerdrPiSession(session: HerdrPiSession, launch: ChildSessionLaunch, dependencies: { connect?: typeof connectHerdrMachine; discoverManifest?: typeof discoverBridgeManifest; createBridge?: (socketPath: string, runId: string) => BridgeChannel } = {}): Promise<void> {
-	const connect = dependencies.connect ?? connectHerdrMachine, discoverManifest = dependencies.discoverManifest ?? discoverBridgeManifest, createBridge = dependencies.createBridge ?? ((socketPath: string, runId: string) => new BridgeChannel(socketPath, runId));
+	const connect = dependencies.connect ?? connectHerdrMachine, discoverManifest = dependencies.discoverManifest ?? discoverBridgeManifestAsync, createBridge = dependencies.createBridge ?? ((socketPath: string, runId: string) => new BridgeChannel(socketPath, runId));
 	let validated: { connection: HerdrForwardedConnection; unsubscribe: () => void; bridgeForward: { socketPath: string; close(): Promise<void> }; bridge: BridgeChannel; candidate: { adopted: boolean; lost?: Error } } | undefined;
 	const result = await boundedHerdrReconnect(session.identity, session.evidenceCursor, async () => {
 		const connection = await connect(launch.machine!); let unsubscribe = () => {}; let bridgeForward: { socketPath: string; close(): Promise<void> } | undefined; let bridge: BridgeChannel | undefined; const generation: { adopted: boolean; lost?: Error } = { adopted: false };
 		try {
 			const snapshot = parseHerdrSessionSnapshot(await connection.client.call<Record<string, unknown>>("session.snapshot"));
 			const agents = snapshotAgents(snapshot);
-			const manifest = discoverManifest(launch.machine!, session.identity.runId, session.identity.runtimeDir); bridgeForward = await connection.forwardRemoteSocket(manifest.socketPath, "bridge-reconnect"); bridge = createBridge(bridgeForward.socketPath, session.identity.runId);
+			const manifest = await discoverManifest(launch.machine!, session.identity.runId, session.identity.runtimeDir); bridgeForward = await connection.forwardRemoteSocket(manifest.socketPath, "bridge-reconnect"); bridge = createBridge(bridgeForward.socketPath, session.identity.runId);
 			const ready = await waitForReadyBridgeFrame(bridge, 8_000, "Reconnected bridge handshake timed out.", true);
 			const candidate: HerdrReconnectCandidate = { endpoint: connection.endpoint, agents, bridge: { runId: ready.runId, nativeSessionId: ready.nativeSessionId as string | undefined, packageVersion: ready.packageVersion as string | undefined, protocol: ready.protocol, evidenceCursor: ready.evidenceCursor as number | undefined, evidenceFloor: ready.evidenceFloor as number | undefined } };
 			const check = reconcileHerdrReconnect(session.identity, candidate, session.evidenceCursor); if (!check.ok) throw new Error(check.reason);
@@ -242,7 +257,7 @@ export async function createHerdrPiSession(launch: ChildSessionLaunch): Promise<
 	try {
 		let reconnectSession: HerdrPiSession | undefined; owned = await owner.provision(); await owner.subscribe((event) => observeHerdr?.(event), () => void reconnectSession?.reconnect());
 		agentName = `pi-${runId.slice(-20)}`; const { terminalId } = await owner.start("pi", agentName, policy.args);
-		const manifest = discoverBridgeManifest(launch.machine, runId, runtimeDir); if (manifest.protocol !== HERDR_PI_PROTOCOL || manifest.packageVersion !== packageJson.version) throw new Error(`Remote pi-subagents bridge version mismatch (remote ${manifest.packageVersion}, local ${packageJson.version}).`);
+		const manifest = await discoverBridgeManifestAsync(launch.machine, runId, runtimeDir); if (manifest.protocol !== HERDR_PI_PROTOCOL || manifest.packageVersion !== packageJson.version) throw new Error(`Remote pi-subagents bridge version mismatch (remote ${manifest.packageVersion}, local ${packageJson.version}).`);
 		const bridgeForward = await connection.forwardRemoteSocket(manifest.socketPath, "bridge"); const bridge = new BridgeChannel(bridgeForward.socketPath, runId);
 		const ready = await waitForReadyBridgeFrame(bridge, 15_000, "Remote Pi bridge handshake timed out.");
 		if (ready.packageVersion !== packageJson.version || ready.nativeSessionId !== manifest.nativeSessionId || ready.cwd !== launch.machine.cwd) throw new Error("Remote Pi bridge handshake identity mismatch.");

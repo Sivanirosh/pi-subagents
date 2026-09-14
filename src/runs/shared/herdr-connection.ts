@@ -33,6 +33,18 @@ function sshEnvCommand(session: string | undefined, command: string): string { c
 
 export function runHerdrRemoteCommand(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}) { return spawnSync(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { encoding: "utf8", env: hardenedSshEnv(options.env), timeout: options.timeout ?? 15_000, maxBuffer: options.maxBuffer ?? MAX_DISCOVERY_BYTES, windowsHide: true }); }
 
+export function runHerdrRemoteCommandAsync(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { env: hardenedSshEnv(options.env), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+		const stdout: Buffer[] = [], stderr: Buffer[] = []; let bytes = 0;
+		const collect = (target: Buffer[]) => (chunk: Buffer) => { bytes += chunk.byteLength; if (bytes > (options.maxBuffer ?? MAX_DISCOVERY_BYTES)) child.kill("SIGTERM"); else target.push(chunk); };
+		child.stdout.on("data", collect(stdout)); child.stderr.on("data", collect(stderr));
+		child.once("error", reject);
+		child.once("close", (status) => { clearTimeout(timer); resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }); });
+		const timer = setTimeout(() => child.kill("SIGTERM"), options.timeout ?? 15_000); timer.unref?.();
+	});
+}
+
 export function parseHerdrEndpoint(value: string, expectedSession?: string): HerdrEndpoint {
 	let parsed: unknown;
 	try { parsed = JSON.parse(value) as unknown; } catch { throw new Error("Remote Herdr endpoint discovery returned malformed JSON."); }
