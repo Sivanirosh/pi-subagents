@@ -88,7 +88,11 @@ test("owned process tree does not claim observed while a detached descendant rem
 	} finally {
 		for (const pid of [grandchildPid, writer.pid]) {
 			try { process.kill(-pid, "SIGKILL"); } catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+				if ((error as NodeJS.ErrnoException).code === "EPERM") {
+					try { process.kill(pid, "SIGKILL"); } catch (fallbackError) {
+						if ((fallbackError as NodeJS.ErrnoException).code !== "ESRCH") throw fallbackError;
+					}
+				} else if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 			}
 		}
 	}
