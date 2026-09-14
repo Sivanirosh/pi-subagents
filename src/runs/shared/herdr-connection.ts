@@ -59,9 +59,9 @@ export function parseHerdrEndpoint(value: string, expectedSession?: string): Her
 	return { socket: p.socket, session, version: p.version, protocol: p.protocol, compatible: true, running: true };
 }
 
-export function discoverHerdrEndpoint(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): HerdrEndpoint {
+export async function discoverHerdrEndpoint(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<HerdrEndpoint> {
 	const discovery = 'herdr_path=$(command -v herdr) || exit 127; case "$herdr_path" in /*/herdr) ;; *) exit 126;; esac; exec "$herdr_path" status server --json';
-	const result = runHerdrRemoteCommand(machine, sshEnvCommand(machine.session, discovery), { ...options, timeout: 15_000, maxBuffer: MAX_DISCOVERY_BYTES });
+	const result = await runHerdrRemoteCommandAsync(machine, sshEnvCommand(machine.session, discovery), { ...options, timeout: 15_000, maxBuffer: MAX_DISCOVERY_BYTES });
 	if (result.error) throw new Error(`Remote Herdr discovery failed: ${result.error.message}`);
 	if (result.status !== 0) throw new Error(`Remote Herdr discovery failed with code ${result.status}: ${(result.stderr || result.stdout).trim()}`);
 	return parseHerdrEndpoint(result.stdout, machine.session);
@@ -118,7 +118,7 @@ async function terminateChild(child: ChildProcess): Promise<void> { const wait =
 
 export async function connectHerdrMachine(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<HerdrForwardedConnection> {
 	if (process.platform === "win32") throw new Error("Pane-native Herdr placement requires OpenSSH StreamLocal forwarding and is not supported on Windows.");
-	const endpoint = discoverHerdrEndpoint(machine, options);
+	const endpoint = await discoverHerdrEndpoint(machine, options);
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-herdr-")); fs.chmodSync(dir, 0o700);
 	const children = new Set<ChildProcess>();
 	const forward = async (remotePath: string, name: string) => {
