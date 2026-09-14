@@ -38,7 +38,7 @@ export function runHerdrRemoteCommandAsync(machine: HerdrMachineReference, comma
 		const child = spawn(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { env: hardenedSshEnv(options.env), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 		const stdout: Buffer[] = [], stderr: Buffer[] = [], maxBuffer = options.maxBuffer ?? MAX_DISCOVERY_BYTES; let stdoutBytes = 0, stderrBytes = 0, error: Error | undefined, settled = false, escalation: NodeJS.Timeout | undefined;
 		const finish = (status: number | null, spawnError = error) => { if (settled) return; settled = true; clearTimeout(timer); if (escalation) clearTimeout(escalation); resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), ...(spawnError ? { error: spawnError } : {}) }); };
-		const terminate = () => { child.kill("SIGTERM"); escalation ??= setTimeout(() => { if (!settled) child.kill("SIGKILL"); }, 1_000); escalation.unref?.(); };
+		const terminate = () => { child.kill("SIGTERM"); escalation ??= setTimeout(() => { if (!settled) { child.kill("SIGKILL"); finish(child.exitCode ?? null); } }, 1_000); escalation.unref?.(); };
 		const collect = (target: Buffer[], stream: "stdout" | "stderr") => (chunk: Buffer) => { const bytes = stream === "stdout" ? (stdoutBytes += chunk.byteLength) : (stderrBytes += chunk.byteLength); if (bytes > maxBuffer) { error ??= new Error(`${stream} maxBuffer length exceeded`); terminate(); } else target.push(chunk); };
 		child.stdout.on("data", collect(stdout, "stdout")); child.stderr.on("data", collect(stderr, "stderr"));
 		child.once("error", (spawnError) => finish(null, spawnError));
