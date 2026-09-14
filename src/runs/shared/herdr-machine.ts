@@ -5,6 +5,7 @@ import type { ExternalProcessStatus, HerdrMachineReference } from "../../shared/
 import { getAgentDir, getProjectConfigDir } from "../../shared/utils.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS, type CodeOwnedExternalCliAdapterId } from "./external-cli-contract.ts";
 import type { runExternalCli } from "./external-cli-runner.ts";
+export { shellQuoteRemote as shellQuote } from "./herdr-connection.ts";
 
 /**
  * Herdr saved-machine placement for external CLI children.
@@ -62,10 +63,6 @@ export interface HerdrMachinePlacement {
 export interface PreparedHerdrMachineExternalCliRun {
 	input: RunExternalCliInput;
 	decorateProcess(process: ExternalProcessStatus): ExternalProcessStatus;
-}
-
-export function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function validateMachineName(value: string): string {
