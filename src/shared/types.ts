@@ -231,6 +231,7 @@ export interface WorkflowReceipt {
 	state: WorkflowReceiptState;
 	createdAt: number;
 	entries: Record<string, WorkflowReceiptEntry>;
+	argsDigest?: string;
 	resource?: WorkflowResourceProvenance;
 	hostSteps?: HostStepNode[];
 	workflowChildren?: WorkflowChildSummary;
@@ -657,6 +658,12 @@ export type ProcessTreeTerminal =
 		verifiedAt: number;
 	}
 	| {
+		state: "observed";
+		mechanism: "windows-taskkill";
+		pid: number;
+		verifiedAt: number;
+	}
+	| {
 		state: "unknown";
 		reason: "unsupported-platform" | "signal-failed" | "verification-failed";
 		diagnostic?: string;
@@ -918,7 +925,7 @@ export interface SubagentResultIntercomPayload {
 // Progress Tracking
 // ============================================================================
 
-export interface ChildWatchdogWarningSummary extends Pick<WatchdogWarningDetails, "severity" | "category" | "summary" | "evidence" | "recommendedAction" | "displayedAt"> {
+export interface ChildWatchdogWarningSummary extends Pick<WatchdogWarningDetails, "severity" | "importance" | "category" | "summary" | "evidence" | "recommendedAction" | "displayedAt"> {
 	/** True when a later assistant turn in the child followed the warning. */
 	addressed: boolean;
 	stalemate: boolean;
@@ -1274,6 +1281,8 @@ export interface SingleResult {
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
+	/** Authoritative before/after Git evidence captured by a pane-native remote machine. */
+	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus };
 	/** Effective thinking level used by this foreground child, when known. */
 	thinking?: string;
 	attemptedModels?: string[];
@@ -1398,6 +1407,7 @@ export interface AgentCapabilityRow {
 	tools: { ambient: boolean; names: string[]; excludeTools?: string[]; mcpDirectTools: string[]; mutationTools?: string[] };
 	model?: { value?: string; fallbackModels?: string[]; thinking?: string | false };
 	execution?: { defaultAsync?: boolean; timeoutMs?: number };
+	acceptance?: { policy?: AcceptanceInput; role?: AcceptanceRole };
 	output?: { path?: string; mode?: OutputMode };
 	extensions?: { names?: string[]; subagentOnly?: string[]; skills?: string[] };
 }
@@ -1422,6 +1432,12 @@ export interface Details {
 	wait?: {
 		reason: "window_elapsed";
 		timedOut: true;
+		activeRunIds: string[];
+		activeProviderItems: Array<{ provider: string; id: string }>;
+	} | {
+		/** Non-terminal internal auto-drain yield; tracked work remains active. */
+		reason: "supervisor_request";
+		timedOut: false;
 		activeRunIds: string[];
 		activeProviderItems: Array<{ provider: string; id: string }>;
 	};
@@ -1485,6 +1501,8 @@ export interface Details {
 	mission?: MissionRecord;
 	workflow?: {
 		value?: unknown;
+		args?: Record<string, unknown>;
+		argsDigest?: string;
 		resource?: WorkflowResourceProvenance;
 		preflightWarnings?: string[];
 		trace: Array<{
@@ -2106,7 +2124,7 @@ export interface ForegroundResumeChild {
 	/** Private bounded launch fields needed to preserve the child contract on resume. */
 	resumeContract?: {
 		modelResponseAliases?: Record<string, string[]>;
-		outputSchema?: JsonSchemaObject;
+		outputSchema?: JsonSchemaObject | false;
 		agentContract?: AgentContract;
 		acceptance?: AcceptanceInput;
 		output?: string | boolean;
@@ -2408,6 +2426,10 @@ export interface RunSyncOptions {
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	cwd?: string;
+	/** Resolved pane-native saved-machine placement. */
+	machine?: HerdrMachineReference;
+	/** Explicit read override resolved by the remote ambient agent profile. */
+	remoteReads?: string[] | false;
 	/** Original cwd input retained for launch diagnostics. */
 	requestedCwd?: string;
 	signal?: AbortSignal;

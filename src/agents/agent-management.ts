@@ -30,7 +30,7 @@ import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { resolveEffectiveThinking, toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
-import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
+import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import { resolveExternalCliBinaryAvailability, type ExternalCliBinaryAvailability } from "../runs/shared/external-cli-preflight.ts";
 import type { AcceptanceInput, AgentCapabilitiesSnapshot, AgentCapabilityRow, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
@@ -736,10 +736,10 @@ function runnerListBadge(agent: AgentConfig, providerNames: Set<string> | undefi
 		const placed = agent.machine ? `${agent.runner.command} @ ${agent.machine}` : agent.runner.command;
 		const availability = externalCliAvailability?.get(externalCliAvailabilityKey(agent.runner.command, agent.machine));
 		if (!availability) return `external-cli:${placed}`;
-		if (agent.machine) return `external-cli:${placed} ssh ${availability.available ? "✓" : "missing"}; machine not preflighted`;
+		if (agent.machine) return `external-cli:${placed} saved Herdr placement; transport ${availability.available ? "✓" : "missing"}; machine not preflighted`;
 		return `external-cli:${placed} ${availability.available ? "✓" : "missing"}`;
 	}
-	if (agent.machine) return `machine: ${agent.machine} (native agents cannot be placed)`;
+	if (agent.machine) return `machine: ${agent.machine} (saved Herdr placement)`;
 	return undefined;
 }
 
@@ -775,8 +775,39 @@ function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<stri
 		if (agent.modelProvider && !agent.model.includes("/")) model = `${agent.modelProvider}/${agent.model}`;
 	}
 	const thinking = agent.thinking === false ? "off" : agent.thinking ?? "default";
-	const machine = agent.machine ? `; Machine: ${agent.machine}${agent.runner?.type === "external-cli" ? "" : " (unsupported for native agents)"}` : "";
-	return `- ${agent.name} (${agentListMetadata(agent, providerNames, externalCliAvailability)}): Description: ${previewDisplayText(agent.description, 240)}; Tools: ${tools}; Model: ${model}; Thinking: ${thinking}${machine}`;
+	const machine = agent.machine ? `; Machine: ${agent.machine} (saved Herdr placement)` : "";
+	const acceptance = formatAcceptanceSummary(agent);
+	return `- ${agent.name} (${agentListMetadata(agent, providerNames, externalCliAvailability)}): Description: ${previewDisplayText(agent.description, 240)}; Tools: ${tools}; Model: ${model}; Thinking: ${thinking}${machine}${acceptance ? `; ${acceptance}` : ""}`;
+}
+
+function formatAcceptanceSummary(agent: AgentConfig): string | undefined {
+	const policy = agent.defaultAcceptance;
+	const summary: string[] = [];
+	if (policy === false) summary.push("Acceptance: disabled");
+	else if (typeof policy === "string") summary.push(`Acceptance: ${policy}`);
+	else if (policy) {
+		const modifiers = [
+			...(policy.evidence ?? []),
+			...(policy.verify ?? []).map((command) => `verify: ${formatAcceptanceDisplayLabel(command.id)}`),
+			...(policy.criteria?.length ? [`criteria: ${policy.criteria.length}`] : []),
+			...(policy.stopRules?.length ? [`stopRules: ${policy.stopRules.length}`] : []),
+		];
+		if (policy.review === false) modifiers.push("review: off");
+		else if (policy.review) {
+			const displayReview = policy.review.agent
+				? { ...policy.review, agent: formatAcceptanceDisplayLabel(policy.review.agent) }
+				: policy.review;
+			modifiers.push(`review: ${formatReviewGateLabel(displayReview)}`);
+		}
+		if (policy.report) modifiers.push(`report: ${policy.report}`);
+		summary.push(`Acceptance: ${policy.level ?? "auto"}${modifiers.length > 0 ? ` (${modifiers.join(", ")})` : ""}`);
+	}
+	if (agent.acceptanceRole) summary.push(`Acceptance role: ${agent.acceptanceRole}`);
+	return summary.length > 0 ? summary.join("; ") : undefined;
+}
+
+function formatAcceptanceDisplayLabel(value: string): string {
+	return JSON.stringify(previewDisplayText(value, 80));
 }
 
 const EXTERNAL_JOB_CAPABILITIES = { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } as const;
@@ -825,6 +856,7 @@ function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; 
 		tools: agentCapabilityTools(agent),
 		model: presentDetails({ value: agent.model, fallbackModels: agent.fallbackModels, thinking: agent.thinking }),
 		execution: presentDetails({ defaultAsync: agent.defaultAsync, timeoutMs: agent.defaultTimeoutMs }),
+		acceptance: presentDetails({ policy: agent.defaultAcceptance, role: agent.acceptanceRole }),
 		output: presentDetails({ path: agent.output, mode: agent.outputMode }),
 		extensions: presentDetails({ names: agent.extensions, subagentOnly: agent.subagentOnlyExtensions, skills: agent.skills }),
 	};

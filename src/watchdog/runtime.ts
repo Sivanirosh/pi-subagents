@@ -14,6 +14,7 @@ import { WatchdogScopeArtifact } from "./scope.ts";
 import { resolveWatchdogConfig } from "./settings.ts";
 import { formatWatchdogOrchestrationActivity, formatWatchdogTurnDelta } from "./turn-delta.ts";
 import {
+	WATCHDOG_WARNING_IMPORTANCES,
 	type ResolvedWatchdogConfig,
 	type WatchdogEndpointConfig,
 	type WatchdogLspRuntimeSnapshot,
@@ -31,6 +32,8 @@ type ReviewStopReason = "stop" | "error" | "aborted" | "length";
 export interface WatchdogReviewResult {
 	warnings?: WatchdogWarning[];
 	stopReason?: ReviewStopReason;
+	/** Provider error text for a failed review, surfaced in status `Last error`. */
+	errorMessage?: string;
 	clarification?: { question: string; evidence: string };
 }
 
@@ -83,6 +86,7 @@ interface MainWatchdogRuntimeOptions {
 	review?: WatchdogReviewFunction;
 	reviewDescription?: string;
 	displayWarning?: (warning: WatchdogWarningDetails, options?: WatchdogWarningSendOptions) => void;
+	displayUserWarning?: (warning: WatchdogWarningDetails) => void;
 	/** Supplying this main-session delivery capability gates clarification (children omit it). */
 	displayClarification?: (content: string) => void;
 	reviewChangesOnly?: boolean;
@@ -130,6 +134,7 @@ export class MainWatchdogRuntime {
 	private readonly reviewConnected: boolean;
 	private readonly reviewDescription: string;
 	private readonly displayWarning: ((warning: WatchdogWarningDetails, options?: WatchdogWarningSendOptions) => void) | undefined;
+	private readonly displayUserWarning: ((warning: WatchdogWarningDetails) => void) | undefined;
 	private readonly reviewChangesOnly: boolean;
 	private readonly lspDiagnostics: WatchdogLspDiagnosticsFunction;
 	private readonly repoChangeSignature: typeof computeWatchdogRepoChangeSignature;
@@ -187,6 +192,7 @@ export class MainWatchdogRuntime {
 		this.reviewConnected = Boolean(options.review);
 		this.reviewDescription = options.reviewDescription ?? (options.review ? "injected seam" : "not wired");
 		this.displayWarning = options.displayWarning;
+		this.displayUserWarning = options.displayUserWarning;
 		this.displayClarification = options.displayClarification;
 		this.reviewChangesOnly = options.reviewChangesOnly === true;
 		this.lspDiagnostics = options.lspDiagnostics ?? collectWatchdogLspDiagnostics;
@@ -467,13 +473,13 @@ export class MainWatchdogRuntime {
 		this.ruleWarningsThisRun.add(violation.summary);
 		const details = normalizeWatchdogWarningDetails(ruleViolationWarning(violation), { state: "displayed", displayedAt: new Date().toISOString() });
 		this.lastWarning = details;
-		this.displayWarning?.(details, { deliverAs: "steer" });
+		this.routeWarning(details, { deliverAs: "steer" });
 	}
 
-	recordDisplayedWarning(warning: WatchdogWarning): WatchdogWarningDetails {
+	displayRecordedWarning(warning: WatchdogWarning): void {
 		const details = normalizeWatchdogWarningDetails(warning, { state: "displayed", source: warning.source ?? "main" });
 		this.lastWarning = details;
-		return details;
+		this.routeWarning(details);
 	}
 
 	getSnapshot(cwd?: string): WatchdogRuntimeSnapshot {
@@ -536,7 +542,13 @@ export class MainWatchdogRuntime {
 	}
 
 	private warningMeetsThreshold(warning: WatchdogWarning): boolean {
-		return this.configResult.config.severityThreshold === "concern" || warning.severity === "blocker";
+		return (WATCHDOG_WARNING_IMPORTANCES as readonly string[]).includes(warning.importance)
+			&& (this.configResult.config.severityThreshold === "concern" || warning.severity === "blocker");
+	}
+
+	private routeWarning(details: WatchdogWarningDetails, options?: WatchdogWarningSendOptions): void {
+		if (details.importance === "high") this.displayWarning?.(details, options);
+		else this.displayUserWarning?.(details);
 	}
 
 	private acceptWarning(epoch: number, reviewId: number, warning: WatchdogWarning): boolean {
@@ -658,7 +670,8 @@ export class MainWatchdogRuntime {
 			}
 			for (const warning of result.warnings ?? []) this.acceptWarning(reviewEpoch, reviewId, warning);
 			if (result.stopReason && result.stopReason !== "stop") {
-				this.fail(`Watchdog review ended with stop reason '${result.stopReason}'.`);
+				const detail = result.errorMessage?.trim() ? ` ${boundWatchdogReviewText(result.errorMessage.trim(), 600)}` : "";
+				this.fail(`Watchdog review ended with stop reason '${result.stopReason}'.${detail}`);
 				return "completed";
 			}
 			this.displayAcceptedReviewWarning(options.correction);
@@ -690,7 +703,7 @@ export class MainWatchdogRuntime {
 		};
 		if (correction) {
 			this.lastWarning = details;
-			this.displayWarning?.(details, { deliverAs: "steer" });
+			this.routeWarning(details, { deliverAs: "steer" });
 			return;
 		}
 		this.deliverBoundaryWarning(details);
@@ -711,7 +724,7 @@ export class MainWatchdogRuntime {
 			: details;
 		this.stalemate = stalemate;
 		this.lastWarning = delivered;
-		this.displayWarning?.(delivered, stalemate ? { triggerTurn: false } : undefined);
+		this.routeWarning(delivered, stalemate ? { triggerTurn: false } : undefined);
 	}
 
 	// The previous boundary finding is a repeat to count, not a duplicate, until stalemate.

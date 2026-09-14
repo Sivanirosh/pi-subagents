@@ -1,4 +1,4 @@
-// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/pi085-clean-install.mjs [artifact-dir] [0.84.3|0.84.4|0.85.0|0.85.1]
+// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.84.3|0.84.4|0.85.1]
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,11 +7,10 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
-const version = process.argv[3] ?? "0.85.0";
-assert.ok(["0.84.3", "0.84.4", "0.85.0", "0.85.1"].includes(version), "requires an explicitly supported smoke version");
-const isPi0850 = version === "0.85.0";
+const version = process.argv[3] ?? "0.85.1";
+assert.ok(["0.84.3", "0.84.4", "0.85.1"].includes(version), "requires an explicitly supported smoke version");
 const isPreChord = version.startsWith("0.84.");
-const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "pi085-smoke-"));
+const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "clean-install-smoke-"));
 fs.mkdirSync(root, { recursive: true });
 const host = path.join(root, "host");
 const extension = path.join(root, "extension");
@@ -40,6 +39,7 @@ fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ private: true
 run("host-install", "npm", ["install", "--no-audit", "--no-fund"], host);
 const packed = JSON.parse(run("pack", "npm", ["pack", "--json", "--pack-destination", root], source).stdout)[0];
 assert.ok(packed.files.some(file => file.path === "runner-peer-preload.mjs"), "peer preload must ship");
+assert.ok(packed.files.some(file => file.path === "runner-peer-loader.mjs"), "older-Node peer loader must ship");
 fs.writeFileSync(path.join(extension, "package.json"), JSON.stringify({ private: true, dependencies: { "pi-subagents": `file:${path.join(root, packed.filename)}` } }));
 run("extension-install", "npm", ["install", "--no-audit", "--no-fund"], extension);
 const installed = path.join(extension, "node_modules/pi-subagents");
@@ -47,10 +47,8 @@ const pi = path.join(host, "node_modules/@earendil-works/pi-coding-agent");
 const { createJiti } = await import(pathToFileURL(path.join(extension, "node_modules/jiti/lib/jiti.mjs")).href);
 const jitiLoader = createJiti(import.meta.url, { fsCache: false });
 const { resolveHostPeerAliases, findHostPeerPackageDir, resolvePackageSubpath } = await jitiLoader.import(path.join(installed, "src/runs/background/runner-aliases.ts"));
-assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-server"), undefined, "host must remain missing server");
 if (version === "0.85.1") assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined, "stable host must remain missing client");
-const pristine = run("pristine-public-sdk", process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(resolvePackageSubpath(pi, ".")).href)})`], cwd, {}, !isPi0850);
-if (isPi0850) assert.match(pristine.stderr, /Cannot find package '@earendil-works\/pi-server'/);
+run("pristine-public-sdk", process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(resolvePackageSubpath(pi, ".")).href)})`], cwd);
 const resolved = resolveHostPeerAliases(pi);
 assert.deepEqual(resolved.missing, []);
 const tui = findHostPeerPackageDir(pi, "@earendil-works/pi-tui");
@@ -60,23 +58,20 @@ if (isPreChord) assert.equal(findHostPeerPackageDir(pi, "@earendil-works/chord")
 for (const specifier of ["@earendil-works/chord", "@earendil-works/chord/context"]) {
 	assert.equal(Boolean(resolved.aliases[specifier]), !isPreChord);
 }
-assert.deepEqual(resolved.supplemental, isPi0850 ? ["@earendil-works/pi-server", "@earendil-works/pi-server/unix"] : []);
-if (!isPi0850) {
-	for (const specifier of ["@earendil-works/pi-server", "@earendil-works/pi-server/unix", "@earendil-works/pi-client/unix"]) assert.equal(resolved.aliases[specifier], undefined);
-}
+assert.equal(resolved.aliases["@earendil-works/pi-client/unix"], undefined);
 fs.writeFileSync(path.join(root, "aliases.json"), JSON.stringify(resolved, null, 2));
 for (const file of ["pi085-child.ts", "pi085-extension.ts"]) fs.copyFileSync(new URL(file, import.meta.url), path.join(cwd, file));
-const childEnv = { SMOKE_EXTENSION: installed, JITI_ALIAS: JSON.stringify(resolved.aliases) };
+const childEnv = { SMOKE_EXTENSION: installed, JITI_ALIAS: JSON.stringify(resolved.aliases), PI_ASYNC_NATIVE_RUNNER: "0" };
 const jiti = path.join(extension, "node_modules/jiti/lib/jiti-cli.mjs");
 const args = [jiti, path.join(cwd, "pi085-child.ts")];
-// The real file-extension gate must fail with aliases alone, not just an import mock.
-if (isPi0850) {
-	const negative = run("without-preload", process.execPath, args, cwd, childEnv, false);
-	assert.match(negative.stderr, /Model "pi085-smoke\/local" not found/);
-}
 const preload = Object.keys(resolved.aliases).length ? ["--import", pathToFileURL(path.join(installed, "runner-peer-preload.mjs")).href] : [];
 const positive = run("child", process.execPath, [...preload, ...args], cwd, childEnv);
 assert.match(positive.stdout, /PASS public SDK\/default child factory/);
-assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-server"), undefined);
+const packedSelection = run("packed-selection", process.execPath, [
+	path.join(source, "test/smoke/packed-runner-selection.mjs"),
+	installed,
+	resolvePackageSubpath(pi, "."),
+], cwd, childEnv);
+assert.match(packedSelection.stdout, /PASS packed node_modules selects Jiti/);
 if (version === "0.85.1") assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined);
 console.log(`${positive.stdout.trim()}\nArtifacts: ${root}`);

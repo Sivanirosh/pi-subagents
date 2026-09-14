@@ -1555,13 +1555,18 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 	});
 
 	it("does not inject inferred acceptance into reviewer prompts", async () => {
-		mockPi.onCall({ output: "VERDICT: PASS" });
-		const result = await runSync(tempDir, [makeAgent("reviewer", { tools: ["read"], completionGuard: false })], "reviewer", "Review the diff and return findings only.", {
-			runId: "reviewer-inferred-acceptance",
-		});
+		for (const [index, task] of [
+			"Review the diff and return findings only.",
+			"Read-only review. Verify release recovery and security; do not edit files.",
+		].entries()) {
+			mockPi.onCall({ output: "VERDICT: PASS" });
+			const result = await runSync(tempDir, [makeAgent("reviewer", { tools: ["read"], completionGuard: false })], "reviewer", task, {
+				runId: `reviewer-inferred-acceptance-${index}`,
+			});
 
-		assert.equal(result.exitCode, 0);
-		assert.doesNotMatch(readCall().args.join("\n"), /## Acceptance Contract/);
+			assert.equal(result.exitCode, 0);
+			assert.doesNotMatch(readCall().args.join("\n"), /## Acceptance Contract/);
+		}
 	});
 
 	it("agent contract keeps acceptance rejection out of execution status", async () => {
@@ -1792,22 +1797,31 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(resumed.savedOutputPath, undefined);
 	});
 
-	it("preserves the structured-output contract when resume fields are omitted", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const schema = { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } };
+	it("retains inherited and disabled discovered schemas across definition changes", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentPath = path.join(tempDir, ".pi", "agents", "typed.md");
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		const definition = (required: string) => `---\nname: typed\ndescription: Typed output\noutputSchema: {"type":"object","required":["${required}"]}\n---\nReturn data.\n`;
+		fs.writeFileSync(agentPath, definition("ok"));
 		const structuredEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
 			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
 		];
+		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true }, writeFiles: [{ path: agentPath, content: definition("changed") }] });
 		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
-		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
-		const result = await makeExecutor([makeAgent("echo")]).execute(
+		mockPi.onCall({ output: "disabled first", writeFiles: [{ path: agentPath, content: definition("later") }] });
+		mockPi.onCall({ output: "disabled resumed" });
+		const executor = makeExecutor([], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), (cwd) => discoverAgents(cwd, "project").agents);
+		const result = await executor.execute(
 			"workflow-inherited-resume-schema",
 			{
 				async: false,
 				workflowScript: `
-					const first = await runs.run("first", { agent: "echo", task: "First", outputSchema: ${JSON.stringify(schema)}, agentContract: { version: 1 }, acceptance: false, output: false });
-					return runs.run("resumed", { resume: first.runId, task: "Resume" });
+					const first = await runs.run("first", { agent: "typed", task: "First", acceptance: false, output: false });
+					const resumed = await runs.run("resumed", { resume: first.runId, task: "Resume" });
+					const disabled = await runs.run("disabled", { agent: "typed", task: "Disabled", outputSchema: false, acceptance: false, output: false });
+					const disabledResumed = await runs.run("disabled-resumed", { resume: disabled.runId, task: "Resume disabled" });
+					return { resumed, disabledResumed };
 				`,
 			},
 			new AbortController().signal,
@@ -1816,9 +1830,12 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		);
 
 		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
-		const resumed = result.details.workflow?.value as { ok?: boolean; structuredOutput?: unknown };
-		assert.equal(resumed.ok, true);
-		assert.deepEqual(resumed.structuredOutput, { ok: true });
+		const value = result.details.workflow?.value as { resumed: { ok?: boolean; structuredOutput?: unknown }; disabledResumed: { ok?: boolean; output?: string; structuredOutput?: unknown } };
+		assert.equal(value.resumed.ok, true);
+		assert.deepEqual(value.resumed.structuredOutput, { ok: true });
+		assert.equal(value.disabledResumed.ok, true);
+		assert.equal(value.disabledResumed.output, "disabled resumed");
+		assert.equal(value.disabledResumed.structuredOutput, undefined);
 	});
 
 	it("auto-resumes a workflow child after a setup abort", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2131,6 +2148,22 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.match(child?.error ?? "", /Missing structured_output call/);
 		assert.ok(child?.structuredOutputPath);
 		assert.equal(fs.existsSync(path.dirname(child.structuredOutputPath)), false);
+	});
+
+	it("enforces a discovered agent outputSchema and lets false opt out", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "typed.md"), `---\nname: typed\ndescription: Typed output\noutputSchema: {"type":"object","required":["ok"]}\n---\nReturn data.\n`);
+		const executor = makeExecutor(discoverAgents(tempDir, "project").agents);
+		mockPi.onCall({ output: "ordinary prose" });
+		const inherited = await executor.execute("schema-default", { agent: "typed", task: "Return data", acceptance: false, artifacts: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(inherited.isError, true);
+		assert.match(inherited.details.results[0]?.error ?? "", /Missing structured_output call/);
+
+		mockPi.onCall({ output: "ordinary prose" });
+		const optedOut = await executor.execute("schema-disabled", { agent: "typed", task: "Return prose", outputSchema: false, acceptance: false, artifacts: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(optedOut.isError, undefined);
+		assert.equal(optedOut.details.results[0]?.finalOutput, "ordinary prose");
 	});
 
 	it("does not create a temporary structured output directory before file-only validation", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -4540,16 +4573,17 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			const acceptance = { level: "checked" as const, criteria: ["Ship it"] };
 			const blockerCheck = (result: RunSyncResult) => result.acceptance?.runtimeChecks?.find((entry) => entry.id === "watchdog-blocker");
 
-			mockPi.onCall({ jsonl: [events.watchdogWarning("concern", "Minor naming concern"), events.acceptanceReport(), events.watchdogWarning("blocker", "Claims tests passed without running them")] });
+			mockPi.onCall({ jsonl: [events.watchdogStatusWarning("concern", "Minor naming concern", { runId: "watchdog-child-run", agent: "echo", childIndex: 0 }), events.acceptanceReport(), events.watchdogStatusWarning("blocker", "Claims tests passed without running them", { importance: "low", seq: 2, runId: "watchdog-child-run", agent: "echo", childIndex: 0 })] });
 			const unaddressed = await runSync(tempDir, agents, "echo", "Task", { runId: "watchdog-child-run", acceptance });
 			assert.deepEqual(unaddressed.watchdog?.warnings?.map((warning) => [warning.severity, warning.addressed]), [["concern", true], ["blocker", false]]);
 			assert.equal(blockerCheck(unaddressed)?.status, "failed");
-			assert.match(blockerCheck(unaddressed)?.message ?? "", /Unresolved watchdog blocker: Claims tests passed without running them/);
+			assert.equal(blockerCheck(unaddressed)?.message, "Unresolved watchdog blocker (details are available in child watchdog status).");
 			assert.equal(unaddressed.acceptance?.status, "rejected");
 			assert.equal(unaddressed.exitCode, 1);
 			assert.match(unaddressed.error ?? "", /Unresolved watchdog blocker/);
+			assert.doesNotMatch(unaddressed.error ?? "", /Claims tests passed without running them/);
 
-			mockPi.onCall({ jsonl: [events.assistantMessage("first pass"), events.watchdogWarning("blocker", "Claims tests passed without running them"), events.acceptanceReport()] });
+			mockPi.onCall({ jsonl: [events.assistantMessage("first pass"), events.watchdogStatusWarning("blocker", "Claims tests passed without running them", { runId: "watchdog-child-run-2", agent: "echo", childIndex: 0 }), events.acceptanceReport()] });
 			const addressed = await runSync(tempDir, agents, "echo", "Task", { runId: "watchdog-child-run-2", acceptance });
 			assert.equal(addressed.watchdog?.warnings?.[0]?.addressed, true);
 			assert.equal(blockerCheck(addressed)?.status, "passed");

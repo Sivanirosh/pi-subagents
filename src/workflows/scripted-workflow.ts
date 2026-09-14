@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -550,7 +550,7 @@ function runLanes(laneSpecs) {
       generatedKey: stage.generatedKey,
       ...workflowPlanStringMetadata(stage.params),
       ...(typeof stage.params.as === "string" && stage.params.as.trim() ? { outputName: stage.params.as.trim() } : {}),
-      ...(stage.params.outputSchema !== undefined ? { structured: true } : {}),
+      ...(stage.params.outputSchema ? { structured: true } : {}),
     })),
   })) });
   const firstItems = lanes.map((lane) => {
@@ -952,6 +952,12 @@ function omitUndefinedWorkflowValues(value, seen = new Set()) {
   return normalized;
 }
 
+function deepFreezeWorkflowArgs(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const entry of Object.values(value)) deepFreezeWorkflowArgs(entry);
+  return Object.freeze(value);
+}
+
 parentPort.on("message", async (message) => {
   if (message.type === "response") {
     const entry = pending.get(message.callId);
@@ -971,6 +977,9 @@ parentPort.on("message", async (message) => {
     if (message.stateEnabled) sandbox.state = state;
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
+    // Rebuild args inside the VM realm: a worker-realm object would expose the worker's unrestricted
+    // Function through args.constructor.constructor, bypassing codeGeneration.strings: false.
+    sandbox.args = deepFreezeWorkflowArgs(vm.runInContext("JSON.parse", context)(JSON.stringify(message.args ?? {})));
     let compiled;
     try {
       assertPortableWorkflowScript(message.script);
@@ -1169,6 +1178,10 @@ export interface WorkflowChildSettledNotification {
 
 export interface RunWorkflowScriptOptions {
 	script: string;
+	/** Normalized raw-script input exposed as the deeply frozen sandbox global `args`. */
+	args?: Readonly<Record<string, unknown>>;
+	/** Parent-session cwd used to recover a stale process cwd. */
+	processCwd?: string;
 	/** Workflow run ID for notifications. Required when onChildSettled is provided. */
 	workflowRunId?: string;
 	/** Host-only first-slice admission context. It is never sent to the workflow worker. */
@@ -1922,6 +1935,32 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	}
 	const launchSemaphore = new Semaphore(options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
 
+	if (options.processCwd !== undefined) {
+		let staleCwd = false;
+		try {
+			realpathSync(process.cwd());
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+			if (code !== "ENOENT") throw new Error("Workflow current cwd could not be validated.", { cause: error });
+			staleCwd = true;
+		}
+		try {
+			if (staleCwd) process.chdir(options.processCwd);
+			else {
+				const target = realpathSync(options.processCwd);
+				if (!statSync(target).isDirectory()) {
+					const error = new Error(`ENOTDIR: not a directory, access '${target}'`) as NodeJS.ErrnoException;
+					error.code = "ENOTDIR";
+					throw error;
+				}
+				accessSync(target, constants.X_OK);
+			}
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			throw new Error(`Workflow process cwd is unavailable: ${options.processCwd}: ${detail}`, { cause: error });
+		}
+	}
+
 	let acornPath: string;
 	try {
 		acornPath = resolveWorkflowParserEntry();
@@ -2509,6 +2548,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			respond(deliver(promise), `runs.run('${key}') result`, (error) => children.set(key, responseBoundaryFailure(key, error)));
 		});
 
-		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined });
+		worker.postMessage({ type: "start", script: options.script, ...(options.args ? { args: options.args } : {}), stateEnabled: options.state !== undefined });
 	});
 }

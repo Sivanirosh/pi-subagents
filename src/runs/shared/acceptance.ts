@@ -11,6 +11,7 @@ import type {
 	AcceptanceLedger,
 	AcceptanceLevel,
 	AcceptanceReport,
+	AcceptanceReviewGate,
 	AcceptanceRole,
 	AcceptanceRuntimeCheck,
 	AcceptanceRuntimeCheckStatus,
@@ -106,8 +107,9 @@ function inferLevel(input: {
 	const roleResolvesReadOnly = input.acceptanceRole !== undefined && inferredReadOnly;
 	const dynamicResolvesReadOnly = inferredReadOnly && !writeTask;
 	const riskyKeywordPattern = /\b(?:release|migration|migrate|security|data[- ]loss|destructive|post-review|fix pass)\b/;
+	// Topic keywords cannot override classified read-only intent; unknown tasks keep their risk gate.
 	const keywordRiskReadOnly = input.acceptanceRole === undefined
-		? intent.kind === "read-only" && !riskyKeywordPattern.test(task)
+		? intent.kind === "read-only"
 		: inferredReadOnly;
 	const risky = Boolean(input.async && writeTask)
 		|| (Boolean(input.dynamic) && !roleResolvesReadOnly && !dynamicResolvesReadOnly)
@@ -370,7 +372,7 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	return errors;
 }
 
-export function validateExecutionAcceptance(input: {
+type ExecutionAcceptanceInput = {
 	acceptance?: unknown;
 	outputSchema?: unknown;
 	tasks?: Array<{ acceptance?: unknown; outputSchema?: unknown }>;
@@ -379,23 +381,39 @@ export function validateExecutionAcceptance(input: {
 		outputSchema?: unknown;
 		parallel?: Array<{ acceptance?: unknown; outputSchema?: unknown }> | { acceptance?: unknown; outputSchema?: unknown };
 	}>;
-}): string[] {
+};
+
+export function validateExecutionAcceptancePolicy(input: ExecutionAcceptanceInput): string[] {
 	const errors = validateAcceptanceInput(input.acceptance, "acceptance");
-	errors.push(...validateAcceptanceReportMode(input.acceptance, input.outputSchema, "acceptance"));
 	for (const [index, task] of (input.tasks ?? []).entries()) {
 		errors.push(...validateAcceptanceInput(task.acceptance, `tasks[${index}].acceptance`));
-		errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `tasks[${index}].acceptance`));
 	}
 	for (const [stepIndex, step] of (input.chain ?? []).entries()) {
 		errors.push(...validateAcceptanceInput(step.acceptance, `chain[${stepIndex}].acceptance`));
-		errors.push(...validateAcceptanceReportMode(step.acceptance, step.outputSchema, `chain[${stepIndex}].acceptance`));
 		if (Array.isArray(step.parallel)) {
 			for (const [taskIndex, task] of step.parallel.entries()) {
 				errors.push(...validateAcceptanceInput(task.acceptance, `chain[${stepIndex}].parallel[${taskIndex}].acceptance`));
-				errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `chain[${stepIndex}].parallel[${taskIndex}].acceptance`));
 			}
 		} else if (step.parallel) {
 			errors.push(...validateAcceptanceInput(step.parallel.acceptance, `chain[${stepIndex}].parallel.acceptance`));
+		}
+	}
+	return errors;
+}
+
+export function validateExecutionAcceptance(input: ExecutionAcceptanceInput): string[] {
+	const errors = validateExecutionAcceptancePolicy(input);
+	errors.push(...validateAcceptanceReportMode(input.acceptance, input.outputSchema, "acceptance"));
+	for (const [index, task] of (input.tasks ?? []).entries()) {
+		errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `tasks[${index}].acceptance`));
+	}
+	for (const [stepIndex, step] of (input.chain ?? []).entries()) {
+		errors.push(...validateAcceptanceReportMode(step.acceptance, step.outputSchema, `chain[${stepIndex}].acceptance`));
+		if (Array.isArray(step.parallel)) {
+			for (const [taskIndex, task] of step.parallel.entries()) {
+				errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `chain[${stepIndex}].parallel[${taskIndex}].acceptance`));
+			}
+		} else if (step.parallel) {
 			errors.push(...validateAcceptanceReportMode(step.parallel.acceptance, step.parallel.outputSchema, `chain[${stepIndex}].parallel.acceptance`));
 		}
 	}
@@ -408,7 +426,7 @@ function validateAcceptanceReportMode(acceptance: unknown, outputSchema: unknown
 	acceptance = normalized.value;
 	if (!acceptance || typeof acceptance !== "object" || Array.isArray(acceptance)) return [];
 	if (!("report" in acceptance)) return [];
-	return outputSchema === undefined ? [`${pathLabel}.report requires outputSchema.`] : [];
+	return outputSchema === undefined || outputSchema === false ? [`${pathLabel}.report requires outputSchema.`] : [];
 }
 
 function normalizeCriteria(criteria: Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
@@ -489,6 +507,12 @@ function acceptanceRequiresChildReport(acceptance: ResolvedAcceptanceConfig): bo
 	return acceptance.criteria.length > 0 || acceptance.evidence.length > 0;
 }
 
+/** Label a declared review gate the same way in prompts and capability summaries. */
+export function formatReviewGateLabel(review: AcceptanceReviewGate): string {
+	const status = review.required === false ? "optional" : "required";
+	return review.agent ? `${status} by ${review.agent}` : status;
+}
+
 export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, options: { reportOptional?: boolean; structuredOutput?: boolean } = {}): string {
 	if (acceptance.level === "none") return "";
 	if (options.reportOptional && !acceptanceRequiresChildReport(acceptance)) return "";
@@ -508,7 +532,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		for (const command of acceptance.verify) lines.push(`- ${command.id}: ${command.command}`);
 	}
 	if (acceptance.review) {
-		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
+		lines.push("", `Review gate: ${formatReviewGateLabel(acceptance.review)}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
 	if (acceptance.stopRules.length > 0) {
@@ -1397,7 +1421,7 @@ export async function evaluateAcceptance(input: {
 	if (input.watchdog) {
 		const unresolved = unresolvedChildWatchdogBlockers(input.watchdog);
 		ledger.runtimeChecks.push(unresolved.length
-			? { id: "watchdog-blocker", status: "failed", message: `Unresolved watchdog blocker: ${unresolved[0]!.summary}` }
+			? { id: "watchdog-blocker", status: "failed", message: "Unresolved watchdog blocker (details are available in child watchdog status)." }
 			: { id: "watchdog-blocker", status: "passed", message: "No unresolved watchdog blockers." });
 	}
 

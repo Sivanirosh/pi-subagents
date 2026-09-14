@@ -1,28 +1,15 @@
 import { spawnSync } from "node:child_process";
-import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
-import { createRequire } from "node:module";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { arbitrateCompletionGuardRescue, createTaskMutationArbiter } from "../shared/llm-intent-arbiter.ts";
+import { installRunnerHttpDispatcher } from "./runner-http-dispatcher.ts";
 
-// Detached runners skip Pi's CLI proxy setup. Keep fetch on the same Undici dispatcher.
-function ensureProxyAwareHttpDispatcher(): void {
-	try {
-		// SAFETY: require loads the pinned direct dependency described by these types.
-		const undici = createRequire(import.meta.url)("undici") as typeof import("undici");
-		const dispatcher = new undici.EnvHttpProxyAgent({ allowH2: false });
-		// Fetch rejects stream errors; the listener prevents an unhandled EventEmitter error.
-		EventEmitter.prototype.on.call(dispatcher, "error", () => {});
-		undici.setGlobalDispatcher(dispatcher);
-		undici.install();
-	} catch (error) {
-		console.error(`[pi-subagents] proxy-aware HTTP dispatcher not installed: ${error instanceof Error ? error.message : String(error)}`);
-	}
-}
 const isRunnerEntrypoint = Boolean(process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href);
-if (isRunnerEntrypoint) ensureProxyAwareHttpDispatcher();
+// Detached Node runners skip Pi's CLI dispatcher setup; install the runner's own.
+if (isRunnerEntrypoint) installRunnerHttpDispatcher({ agentDir: getAgentDir(), cwd: process.cwd() });
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "./result-files.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
@@ -30,12 +17,13 @@ import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilie
 import { isStorageCapacityError } from "../../shared/file-system-retry.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, watchAsyncControlInbox, type SteerRequest, type StopRequest } from "./control-channel.ts";
+import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, consumeStopRequestPayloads, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, watchAsyncControlInbox, type SteerRequest, type StopRequest } from "./control-channel.ts";
 import { deadlineCheckpointDelayMs } from "./deadline-checkpoint.ts";
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths, writeArtifact, writeMetadata } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, injectSingleOutputInstruction, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { runSetupCommand } from "../shared/worktree-setup-command.ts";
 import {
 	type ActivityState,
 	type ArtifactConfig,
@@ -117,7 +105,7 @@ import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDi
 import { formatModelAttemptNote, formatSubagentModelVerificationError, isContextOverflow, isRetryableModelFailureAttempt, recordRetryableModelFailure } from "../shared/model-fallback.ts";
 import { markProcessTerminalCandidateLeaseRelease, processTerminalPath, writeProcessTerminalCandidate, type ProcessTerminalCandidate } from "./process-terminal.ts";
 import { createSteeringStatus, recordSteeringRequest, steeringStatus, terminalSteeringNoticeState, unconsumedSteerReason, updateSteeringTarget } from "./steering.ts";
-import { PROMPT_REDACTED, detectSubagentError, extractTextFromContent, extractToolArgsPreview, formatEmptyTerminalAssistantResponseError, getFinalOutput, hasEmptyTerminalAssistantResponse, readStatus } from "../../shared/utils.ts";
+import { PROMPT_REDACTED, detectSubagentError, extractTextFromContent, extractToolArgsPreview, formatEmptyTerminalAssistantResponseError, getAgentDir, getFinalOutput, hasEmptyTerminalAssistantResponse, readStatus } from "../../shared/utils.ts";
 import { evaluateCompletionMutationGuard, expectsImplementationMutation, hasMutationToolCapability, validateImplementationToolContract } from "../shared/completion-guard.ts";
 import { planCompletionEvidence, projectSettlementDiagnostic } from "../shared/completion-evidence.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
@@ -169,6 +157,7 @@ import { resolveCodexExecLaunch } from "../shared/codex-exec-adapter.ts";
 import { resolveCursorAgentLaunch } from "../shared/cursor-agent-adapter.ts";
 import { resolveExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { formatHerdrMachineHint, prepareHerdrMachineExternalCliRun } from "../shared/herdr-machine.ts";
+import { HerdrExternalNeedsAttentionError, createHerdrExternalAdapter, prepareInternalHerdrExternalAdapter, type HerdrExternalAdapterId, type HerdrExternalResult } from "../shared/herdr-external-adapters.ts";
 import { runExternalJob } from "../shared/external-job-runner.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -277,6 +266,7 @@ interface StepResult {
 	sessionFile?: string;
 	intercomTarget?: string;
 	model?: string;
+	nativeMachine?: import("../../shared/types.ts").SingleResult["nativeMachine"];
 	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
@@ -285,6 +275,7 @@ interface StepResult {
 	totalCost?: CostSummary;
 	artifactPaths?: ArtifactPaths;
 	outputSaveError?: string;
+	artifactOutputSaveFailed?: true;
 	metadataSaveError?: string;
 	truncated?: boolean;
 	transcriptPath?: string;
@@ -664,6 +655,38 @@ function writeRunLog(
 	write(logPath, lines.join("\n"));
 }
 
+function expectedMissingGitEvidence(error: unknown): boolean {
+	if (typeof (error as { code?: unknown })?.code !== "number") return false;
+	const stderr = (error as { stderr?: unknown }).stderr;
+	const detail = Buffer.isBuffer(stderr) ? stderr.toString("utf-8") : String(stderr ?? "");
+	return /not a git repository|Needed a single revision/i.test(detail);
+}
+
+async function readGitFingerprint(cwd: string, signal: AbortSignal, onError: (error: unknown) => void): Promise<string | undefined> {
+	try {
+		const runGit = async (args: string[]) => {
+			const result = await runSetupCommand("git", args, {
+				cwd, signal, maxBuffer: 16 * 1024 * 1024, deadlineAt: Date.now() + 30_000,
+				acceptedExitCodes: Array.from({ length: 256 }, (_, code) => code),
+			});
+			if (result.error) throw result.error;
+			if (result.status !== 0) {
+				throw Object.assign(new Error(result.stderr || `git exited with ${result.status}`), { code: result.status, stderr: result.stderr });
+			}
+			return result.stdoutBuffer;
+		};
+		const headOutput = await runGit(["rev-parse", "--verify", "HEAD"]);
+		const head = headOutput.toString("utf-8").trim();
+		if (!head) return undefined;
+		const status = await runGit(["status", "--porcelain=v1", "-z", "--untracked-files=normal"]);
+		return `${head}\0${status.toString("base64")}`;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "PROCESS_TREE_UNVERIFIED") throw error;
+		if (!signal.aborted && !expectedMissingGitEvidence(error)) onError(error);
+		return undefined;
+	}
+}
+
 /** Context for running a single step */
 interface SingleStepContext {
 	previousOutput: string;
@@ -708,6 +731,8 @@ interface SingleStepContext {
 	onAttemptStart?: (attempt: { model?: string; thinking?: string; contextLimit?: number }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 	onExternalProcess?: (process: ExternalProcessStatus) => void;
+	prepareExternalActivity?: (cwd: string, signal: AbortSignal) => Promise<void>;
+	onExternalStreamActivity?: () => void;
 	onExternalJob?: (status: ExternalJobStatus) => void;
 	skipAcceptance?: () => boolean;
 	/** Authoritative owner decision after event delivery; undefined includes incomplete run-wide usage. */
@@ -731,6 +756,12 @@ function decorateHerdrMachineResult<T extends { output: string; exitCode: number
 	const note = result.exitCode === 0 && adapter?.endsWith("-writer") ? `Changes made by this run live on ${machine.label ?? machine.id} at ${machine.cwd}; the local checkout is unchanged.` : undefined;
 	const output = note ? (result.output.trim() ? `${result.output.trimEnd()}\n\n${note}` : note) : result.output;
 	return { ...result, output, ...(error !== undefined ? { error } : {}) };
+}
+
+export async function settleHerdrExternalRunnerError(error: unknown, adapter: HerdrExternalAdapterId, evidence: Parameters<ReturnType<typeof createHerdrExternalAdapter>["normalize"]>[0], retain: () => Promise<void>): Promise<HerdrExternalResult> {
+	await retain();
+	if (!(error instanceof HerdrExternalNeedsAttentionError)) throw error;
+	return createHerdrExternalAdapter(adapter).normalize(evidence, error.message);
 }
 
 export async function runSingleStepInner(
@@ -894,6 +925,52 @@ export async function runSingleStepInner(
 
 	if (step.runner?.type === "external-cli") {
 		const externalCwd = step.machine?.cwd ?? step.cwd ?? ctx.cwd;
+		const externalAbortSignal = combinedAbortSignal([ctx.timeoutSignal, ctx.stopSignal]);
+		if (!step.machine && externalAbortSignal) await ctx.prepareExternalActivity?.(externalCwd, externalAbortSignal);
+		if (externalAbortSignal?.aborted) {
+			const stopped = ctx.stopSignal?.aborted === true;
+			const message = stopped ? ctx.stopMessage ?? "Subagent stopped by user." : ctx.timeoutMessage ?? "Subagent timed out.";
+			return omitUndefinedProperties({ agent: step.agent, context: step.context, output: message, error: message, exitCode: 1, stopped: stopped || undefined, timedOut: stopped ? undefined : true });
+		}
+		if (step.machine) {
+			const runner = resolveExternalCliRunnerStatus({ ...step.runner, machine: step.machine });
+			const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
+			const placedRunId = `${ctx.id}-${ctx.flatIndex}`;
+			const session = await prepareInternalHerdrExternalAdapter({ adapter: step.runner.adapter as HerdrExternalAdapterId, machine: step.machine, runId: placedRunId }, {});
+			let timedOut = false, stopped = false, retain = false;
+			const evidenceInput = { runId: placedRunId, requestId: `prompt-${ctx.flatIndex}`, task: buildExternalCliPrompt(step.systemPrompt ?? "", task), cwd: externalCwd, nativeSessionId: session.launch.nativeSessionId };
+			let resolveInterruption!: (value: "timeout" | "stop") => void, rejectInterruption!: (error: unknown) => void;
+			const interruption = new Promise<"timeout" | "stop">((resolve, reject) => { resolveInterruption = resolve; rejectInterruption = reject; });
+			ctx.registerTimeout?.(() => { timedOut = true; retain = true; resolveInterruption("timeout"); });
+			ctx.registerStop?.(() => { stopped = true; void session.abort().then(() => resolveInterruption("stop"), rejectInterruption); });
+			try {
+				let settled: HerdrExternalResult;
+				try {
+					const raced = await Promise.race([session.promptAndSettle(evidenceInput).then((value) => ({ kind: "settled" as const, value })), interruption.then((kind) => ({ kind }))]);
+					if (raced.kind === "settled") settled = raced.value;
+					else if (raced.kind === "timeout") settled = createHerdrExternalAdapter(step.runner.adapter as HerdrExternalAdapterId).normalize(evidenceInput, "Placed external run timed out; truthful pane retained for inspection.");
+					else return { agent: step.agent, context: step.context, output: "Placed external run stopped by user.", outputState: "present", exitCode: 1, stopped: true, runner, execution: { status: "stopped", success: false, exitCode: 1, stopped: true } };
+				} catch (error) {
+					retain = true;
+					settled = await settleHerdrExternalRunnerError(error, step.runner.adapter as HerdrExternalAdapterId, evidenceInput, () => session.retain());
+				}
+				const output = settled.output;
+				try { fs.writeFileSync(ctx.outputFile, output, "utf-8"); } catch { /* Observability output is best-effort. */ }
+				const resolvedOutput = step.outputPath ? resolveSingleOutput(step.outputPath, output, outputSnapshot, step.outputClaimPath) : { fullOutput: output };
+				const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
+				const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({ fullOutput: resolvedOutput.fullOutput, outputPath: step.outputPath, outputMode: step.outputMode, exitCode: 1, preserveSavedOutput: true, savedPath: resolvedOutput.savedPath, outputReference, saveError: resolvedOutput.saveError }));
+				const artifactErrors = artifactPaths && ctx.artifactConfig?.enabled !== false ? persistStepArtifacts({ artifactPaths, artifactConfig: ctx.artifactConfig, output: formatOutputArtifactContent(omitUndefinedProperties({ output: resolvedOutput.fullOutput, metadataPath: ctx.artifactConfig?.includeMetadata === false ? undefined : artifactPaths.metadataPath })), metadata: { runId: ctx.id, agent: step.agent, task: PROMPT_REDACTED, runner, placement: session.owner.identity, settlement: settled.settlement, outcome: settled.outcome, timestamp: Date.now() } }) : {};
+				return omitUndefinedProperties({ agent: step.agent, ...(childSessionName ? { sessionName: childSessionName } : {}), context: step.context, output: finalizedOutput.displayOutput, outputState: output.trim() ? "present" : "absent", exitCode: 1, error: resolvedOutput.fatalError ? resolvedOutput.saveError : undefined, timedOut, stopped, artifactPaths, outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined, metadataSaveError: artifactErrors.metadataSaveError, runner, execution: { status: "partial", success: false, exitCode: 1 } });
+			} catch (error) {
+				// Any post-allocation uncertainty retains the pane; only explicit stop
+				// and successful exact settlement are destructive.
+				retain = true;
+				throw error;
+			} finally {
+				ctx.registerTimeout?.(undefined); ctx.registerStop?.(undefined);
+				if (retain) await session.retain(); else await session.dispose();
+			}
+		}
 		const adapterLaunch = step.runner.adapter === "codex-exec" || step.runner.adapter === "codex-exec-writer"
 			? resolveCodexExecLaunch({ adapter: step.runner.adapter, command: step.runner.command, asyncDir: path.dirname(ctx.outputFile), stepIndex: ctx.flatIndex })
 			: step.runner.adapter === "claude-code" || step.runner.adapter === "claude-code-writer"
@@ -903,6 +980,10 @@ export async function runSingleStepInner(
 				: undefined;
 		const runner = resolveExternalCliRunnerStatus({ ...step.runner, ...(adapterLaunch ? { args: adapterLaunch.args } : {}), ...(step.machine ? { machine: step.machine } : {}) });
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
+		const onExternalOutput = (chunk: Buffer): void => {
+			if (chunk.length > 0) ctx.onExternalStreamActivity?.();
+			ctx.orcaProgressTab?.append(chunk.toString("utf-8"));
+		};
 		const externalInput = omitUndefinedProperties({
 			command: adapterLaunch?.command ?? runner.command,
 			args: adapterLaunch?.args ?? runner.args,
@@ -921,8 +1002,8 @@ export async function runSingleStepInner(
 			timeoutMessage: ctx.timeoutMessage,
 			stopMessage: ctx.stopMessage,
 			onProcess: ctx.onExternalProcess,
-			onStdout: (chunk: Buffer) => ctx.orcaProgressTab?.append(chunk.toString("utf-8")),
-			onStderr: (chunk: Buffer) => ctx.orcaProgressTab?.append(chunk.toString("utf-8")),
+			onStdout: onExternalOutput,
+			onStderr: onExternalOutput,
 		});
 		const preparedExternal = prepareHerdrMachineExternalCliRun(externalInput, step.machine ? { machine: step.machine, ...(step.machineEnv ? { env: step.machineEnv } : {}) } : undefined, { localCwd: ctx.cwd });
 		const ran = await runExternalCli(preparedExternal.input);
@@ -967,6 +1048,7 @@ export async function runSingleStepInner(
 			processSignal: external.processSignal,
 			artifactPaths,
 			outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
+			artifactOutputSaveFailed: artifactErrors.outputSaveError ? true : undefined,
 			metadataSaveError: artifactErrors.metadataSaveError,
 			runner,
 			externalProcess: externalProcess,
@@ -1036,6 +1118,7 @@ export async function runSingleStepInner(
 			stopped: external.stopped,
 			artifactPaths,
 			outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
+			artifactOutputSaveFailed: artifactErrors.outputSaveError ? true : undefined,
 			metadataSaveError: artifactErrors.metadataSaveError,
 			runner,
 			externalJob: external.externalJob,
@@ -1069,7 +1152,7 @@ export async function runSingleStepInner(
 	let toolBudget = step.toolBudget ? initialToolBudgetState(step.toolBudget) : undefined;
 	let toolBudgetBlocked = false;
 	let actualLaunchContractDigest = step.launchContractDigest;
-	const mutationSnapshot = snapshotTrackedMutations(step.cwd ?? ctx.cwd);
+	const mutationSnapshot = step.machine ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: step.cwd ?? ctx.cwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(step.cwd ?? ctx.cwd);
 	let finalMutationEvidence = collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
 
 	let modelIndex = 0;
@@ -1298,7 +1381,8 @@ export async function runSingleStepInner(
 		const completionGuardEnabled = isAgentContract(step.agentContract) ? step.completionGuard === true : step.completionGuard !== false;
 		const completionToolPlan = resolvedTaskToolPlan;
 		const completionTools = completionToolPlan ? (completionToolPlan.explicitToolAllowlist ? completionToolPlan.effectiveToolAllowlist : undefined) : step.tools;
-		const mutationEvidence = collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
+		const remoteGitChanged = run.nativeMachine?.initialGit && run.nativeMachine.finalGit ? run.nativeMachine.initialGit.head !== run.nativeMachine.finalGit.head || run.nativeMachine.initialGit.dirty !== run.nativeMachine.finalGit.dirty : undefined;
+		const mutationEvidence = run.nativeMachine ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
 		finalMutationEvidence = mutationEvidence;
 		const completionMutationEvidence = ctx.trackedMutationEvidenceForCompletionGuard === false ? undefined : mutationEvidence;
 		const completionGuard = completionDiagnosticsEligible && run.exitCode === 0 && !run.error && !structuredError && !hiddenError?.hasError && !midToolExitError && !emptyOutputError && completionGuardEnabled
@@ -1480,7 +1564,9 @@ export async function runSingleStepInner(
 	}
 
 	const rawOutput = finalResult?.finalOutput ?? "";
-	const outputForPersistence = stripAcceptanceReport(rawOutput);
+	let outputForPersistence = stripAcceptanceReport(rawOutput);
+	if (!outputForPersistence.trim() && finalResult?.structuredOutput !== undefined)
+		outputForPersistence = JSON.stringify(finalResult.structuredOutput, null, 2);
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
 		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, step.outputClaimPath)
 		: { fullOutput: outputForPersistence };
@@ -1598,6 +1684,7 @@ export async function runSingleStepInner(
 				task: PROMPT_REDACTED,
 				exitCode: effectiveFinalExitCode,
 				model: finalResult?.model,
+				nativeMachine: finalResult?.nativeMachine,
 				attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 				modelAttempts,
 				usage,
@@ -1628,6 +1715,7 @@ export async function runSingleStepInner(
 		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
+		nativeMachine: finalResult?.nativeMachine,
 		thinking: resolveEffectiveThinking(finalResult?.model, step.thinking),
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
@@ -1637,6 +1725,7 @@ export async function runSingleStepInner(
 		artifactPaths,
 		savedOutputPath: finalizedOutput.savedPath,
 		outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
+		artifactOutputSaveFailed: artifactErrors.outputSaveError ? true : undefined,
 		metadataSaveError: artifactErrors.metadataSaveError,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),
@@ -1880,8 +1969,12 @@ function missingRequiredOutputAfterUsefulMutation(result: SingleStepResult): boo
 }
 
 function partialExecutionWithUsefulMutation(result: SingleStepResult): boolean {
+	if (result.execution?.status !== "partial") return false;
+	// Pane-native external results are deliberately partial from bounded terminal
+	// evidence alone; Pi mutation-based partials retain their existing behavior.
+	if (result.runner?.type === "external-cli" && result.runner.machine) return true;
 	const fileMutation = result.effects?.fileMutation;
-	return result.execution?.status === "partial" && (fileMutation?.attempted === true || Boolean(fileMutation?.evidence?.changedFiles.length));
+	return fileMutation?.attempted === true || Boolean(fileMutation?.evidence?.changedFiles.length);
 }
 
 function partialEvidenceResult(result: SingleStepResult): boolean {
@@ -1993,6 +2086,7 @@ export async function runSubagent(
 	const timeoutAbortController = new AbortController();
 	const stopAbortController = new AbortController();
 	const setupInterruptController = new AbortController();
+	const runStopSignal = AbortSignal.any([timeoutAbortController.signal, stopAbortController.signal]);
 	const setupSignal = AbortSignal.any([timeoutAbortController.signal, stopAbortController.signal, setupInterruptController.signal]);
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 	let latestSessionFile: string | undefined;
@@ -2615,6 +2709,7 @@ export async function runSubagent(
 		}
 		const appendedSteps = requests.flatMap((request) => request.steps);
 		steps.push(...appendedSteps);
+		flatSteps.push(...flattenSteps(appendedSteps));
 		const now = Date.now();
 		const pendingAppends = countPendingChainAppendRequests(asyncDir);
 		const added = appendRunnerStepsToStatus({
@@ -2648,9 +2743,66 @@ export async function runSubagent(
 		setOptionalProperty(groupNode, "acceptanceStatus", acceptance?.status ?? groupNode.acceptanceStatus);
 	};
 
+	const EXTERNAL_GIT_PROBE_MIN_INTERVAL_MS = 2_000;
+	type ExternalActivityEvidence = {
+		cwd?: string;
+		lastStreamActivityAt?: number;
+		fingerprint?: string;
+		probeInFlight?: Promise<void>;
+		lastProbeStartedAt?: number;
+	};
+	const externalActivityEvidence = new Map<number, ExternalActivityEvidence>();
+	const gitProbesByCwd = new Map<string, Promise<string | undefined>>();
+	let periodicGitProbeFailure: { index: number; error: Error; message: string } | undefined;
+	const reportedGitProbeErrors = new Set<string>();
+	const reportGitProbeError = (externalCwd: string, error: unknown): void => {
+		if (reportedGitProbeErrors.has(externalCwd)) return;
+		reportedGitProbeErrors.add(externalCwd);
+		const detail = error instanceof Error ? error.message : String(error);
+		console.error(`[pi-subagents] Git activity evidence unavailable for '${externalCwd.slice(-300)}'; check the cwd and Git installation: ${detail.slice(0, 500)}`);
+	};
+	const readSharedGitFingerprint = (externalCwd: string): Promise<string | undefined> => {
+		const inFlight = gitProbesByCwd.get(externalCwd);
+		if (inFlight) return inFlight;
+		const probe = readGitFingerprint(externalCwd, runStopSignal, (error) => reportGitProbeError(externalCwd, error)).finally(() => gitProbesByCwd.delete(externalCwd));
+		gitProbesByCwd.set(externalCwd, probe);
+		return probe;
+	};
+	const recordPeriodicGitProbeFailure = (index: number, error: unknown): void => {
+		if (periodicGitProbeFailure) return;
+		const cause = error instanceof Error ? error : new Error(String(error));
+		const message = `PROCESS_TREE_UNVERIFIED: ${cause.message}`;
+		periodicGitProbeFailure = { index, error: cause, message };
+		statusPayload.error = message;
+		const step = statusPayload.steps[index];
+		if (step) step.error = message;
+		statusPayload.lastUpdate = Date.now();
+		writeStatusPayload();
+		appendJsonl(eventsPath, JSON.stringify({
+			type: "subagent.run.process_tree_unverified",
+			ts: statusPayload.lastUpdate,
+			runId: id,
+			index,
+			code: "PROCESS_TREE_UNVERIFIED",
+			message,
+		}));
+	};
+	const prepareExternalActivity = async (index: number, externalCwd: string, signal: AbortSignal): Promise<void> => {
+		if (!controlConfig.enabled) return;
+		const resolvedCwd = path.resolve(externalCwd);
+		const evidence: ExternalActivityEvidence = { cwd: resolvedCwd, lastProbeStartedAt: performance.now() };
+		externalActivityEvidence.set(index, evidence);
+		evidence.fingerprint = await readGitFingerprint(resolvedCwd, signal, (error) => reportGitProbeError(resolvedCwd, error));
+	};
+	const recordExternalStreamActivity = (index: number): void => {
+		const evidence = externalActivityEvidence.get(index) ?? {};
+		externalActivityEvidence.set(index, evidence);
+		evidence.lastStreamActivityAt = Date.now();
+	};
 	const stepOutputActivityAt = (index: number): number => {
 		const step = statusPayload.steps[index];
 		let lastActivityAt = step?.lastActivityAt ?? step?.startedAt ?? overallStartTime;
+		lastActivityAt = Math.max(lastActivityAt, externalActivityEvidence.get(index)?.lastStreamActivityAt ?? 0);
 		const outputPath = path.join(asyncDir, `output-${index}.log`);
 		try {
 			lastActivityAt = Math.max(lastActivityAt, fs.statSync(outputPath).mtimeMs);
@@ -3018,7 +3170,7 @@ export async function runSubagent(
 			return;
 		}
 		if (event.type === "message_end") {
-			const next = applyChildWatchdogMessage(step.watchdog, event.message, now);
+			const next = applyChildWatchdogMessage(step.watchdog, event.message);
 			if (next) step.watchdog = next;
 			if (next && (event.message as { role?: unknown } | undefined)?.role === "custom") {
 				statusPayload.lastUpdate = now;
@@ -3159,7 +3311,7 @@ export async function runSubagent(
 		// A sibling may keep aggregate attention unchanged; publish this step's transition.
 		writeStatusPayload(step.activityState !== previousActivityState);
 	};
-	const updateRunnerActivityState = (now: number): boolean => {
+	const updateRunnerActivityState = (now: number, skipExternalProbeIndex?: number): boolean => {
 		if (!controlConfig.enabled) return false;
 		let changed = false;
 		let runLastActivityAt = statusPayload.lastActivityAt ?? overallStartTime;
@@ -3176,12 +3328,35 @@ export async function runSubagent(
 				config: controlConfig,
 				startedAt: step.startedAt ?? overallStartTime,
 				lastActivityAt,
-				turnCount: step.turnCount,
+				turnCount: flatSteps[index]?.runner?.type === "external-cli" ? 1 : step.turnCount,
 				currentTool: step.currentTool,
 				thinking: step.thinking,
 				now,
 			}));
 			if (idleState === "needs_attention") {
+				const evidence = externalActivityEvidence.get(index);
+				if (index !== skipExternalProbeIndex && evidence?.cwd && evidence.fingerprint) {
+					if (evidence.probeInFlight) continue;
+					if (performance.now() - (evidence.lastProbeStartedAt ?? 0) >= EXTERNAL_GIT_PROBE_MIN_INTERVAL_MS) {
+						evidence.lastProbeStartedAt = performance.now();
+						const baseline = evidence.fingerprint;
+						evidence.probeInFlight = readSharedGitFingerprint(evidence.cwd).then((fingerprint) => {
+							if (requiredStatusStep(statusPayload, index).status !== "running") return;
+							if (fingerprint && fingerprint !== baseline) {
+								evidence.fingerprint = fingerprint;
+								evidence.lastStreamActivityAt = Date.now();
+								updateRunnerActivityState(Date.now());
+							} else {
+								updateRunnerActivityState(Date.now(), index);
+							}
+						}).catch((error: unknown) => {
+							recordPeriodicGitProbeFailure(index, error);
+						}).finally(() => {
+							delete evidence.probeInFlight;
+						});
+						continue;
+					}
+				}
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
 				if (previous !== "needs_attention") {
@@ -3243,11 +3418,15 @@ export async function runSubagent(
 	};
 	const finalizeWorktree = async (setup: WorktreeSetup, stepIndex: number, flatStartIndex: number, action: () => void, deadlineAt?: number): Promise<void> => {
 		let admitted = false;
-		try { await withWorktreeTransaction(() => {
-			if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error("Run deadline expired before worktree cleanup");
-			admitted = true;
-			action();
-		}); }
+		try {
+			await Promise.all([...externalActivityEvidence.values()].map((evidence) => evidence.probeInFlight).filter((probe): probe is Promise<void> => probe !== undefined));
+			if (periodicGitProbeFailure) throw periodicGitProbeFailure.error;
+			await withWorktreeTransaction(() => {
+				if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error("Run deadline expired before worktree cleanup");
+				admitted = true;
+				action();
+			});
+		}
 		catch (error) {
 			if (admitted) throw error;
 			const reason = `Worktree finalization retained; manual reconciliation required: ${error instanceof Error ? error.message : String(error)}`;
@@ -3302,16 +3481,17 @@ export async function runSubagent(
 		interruptActiveChildren();
 	};
 	const stopRunner = () => {
-		if (stopped || timedOut || interrupted || statusPayload.state !== "running") return;
+		if (stopped || timedOut || (statusPayload.state !== "running" && statusPayload.state !== "paused")) return;
 		stopped = true;
+		interrupted = false;
 		const now = Date.now();
 		statusPayload.stopped = true;
 		statusPayload.error = stopMessage;
 		currentActivityState = undefined;
 		delete statusPayload.activityState;
 		statusPayload.lastUpdate = now;
-		for (const step of statusPayload.steps) {
-			if (step.status !== "running" && step.status !== "pending") continue;
+		for (const [index, step] of statusPayload.steps.entries()) {
+			if (step.status !== "running" && step.status !== "pending" && step.status !== "paused") continue;
 			step.status = "stopped";
 			step.error = stopMessage;
 			step.exitCode = 1;
@@ -3320,6 +3500,8 @@ export async function runSubagent(
 			step.endedAt = now;
 			step.durationMs = step.startedAt ? now - step.startedAt : 0;
 			step.lastActivityAt = now;
+			const result = results[index];
+			if (result?.interrupted) results[index] = { ...result, output: stopMessage, error: stopMessage, exitCode: 1, success: false, interrupted: false, stopped: true };
 		}
 		writeStatusPayload();
 		appendJsonl(eventsPath, JSON.stringify({
@@ -3756,6 +3938,8 @@ export async function runSubagent(
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 					onExternalProcess: (process) => updateExternalProcess(fi, process),
+					prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(fi, externalCwd, signal),
+					onExternalStreamActivity: () => recordExternalStreamActivity(fi),
 					onExternalJob: (externalJob) => updateExternalJob(fi, externalJob),
 					skipAcceptance: () => timedOut || stopped || childStopRequests.has(fi),
 					usageBudgetExhausted: continuationUsageBudgetExhausted,
@@ -3765,7 +3949,7 @@ export async function runSubagent(
 				const taskEndTime = Date.now();
 				const childInterrupted = singleResult.interrupted === true;
 				const childStopped = singleResult.stopped === true;
-				requiredStatusStep(statusPayload, fi).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
+				requiredStatusStep(statusPayload, fi).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.execution?.status === "partial" ? "partial" : singleResult.exitCode === 0 ? "complete" : "failed";
 				requiredStatusStep(statusPayload, fi).endedAt = taskEndTime;
 				requiredStatusStep(statusPayload, fi).durationMs = taskEndTime - taskStartTime;
 				requiredStatusStep(statusPayload, fi).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
@@ -3836,7 +4020,7 @@ export async function runSubagent(
 					output: pr.output,
 					outputState: pr.outputState,
 					error: pr.error,
-					success: pr.stopped !== true && pr.interrupted !== true && pr.exitCode === 0,
+					success: pr.stopped !== true && pr.interrupted !== true && pr.exitCode === 0 && pr.execution?.status !== "partial",
 					exitCode: pr.interrupted === true ? 0 : pr.exitCode,
 					skipped: pr.skipped,
 					interrupted: pr.interrupted,
@@ -3854,6 +4038,8 @@ export async function runSubagent(
 					totalCost: pr.totalCost,
 					usage: pr.usage,
 					artifactPaths: pr.artifactPaths,
+					outputSaveError: pr.outputSaveError,
+					artifactOutputSaveFailed: pr.artifactOutputSaveFailed,
 					transcriptPath: pr.transcriptPath,
 					transcriptError: pr.transcriptError,
 					effects: pr.effects,
@@ -4168,6 +4354,8 @@ export async function runSubagent(
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking, attempt.contextLimit),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 							onExternalProcess: (process) => updateExternalProcess(fi, process),
+							prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(fi, externalCwd, signal),
+							onExternalStreamActivity: () => recordExternalStreamActivity(fi),
 							onExternalJob: (externalJob) => updateExternalJob(fi, externalJob),
 							skipAcceptance: () => timedOut || stopped || childStopRequests.has(fi),
 							usageBudgetExhausted: continuationUsageBudgetExhausted,
@@ -4183,7 +4371,7 @@ export async function runSubagent(
 						const childInterrupted = singleResult.interrupted === true;
 						const childStopped = singleResult.stopped === true;
 
-						requiredStatusStep(statusPayload, fi).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
+						requiredStatusStep(statusPayload, fi).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.execution?.status === "partial" ? "partial" : singleResult.exitCode === 0 ? "complete" : "failed";
 						requiredStatusStep(statusPayload, fi).endedAt = taskEndTime;
 						requiredStatusStep(statusPayload, fi).durationMs = taskDuration;
 						requiredStatusStep(statusPayload, fi).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
@@ -4295,7 +4483,7 @@ export async function runSubagent(
 						output: pr.output,
 						outputState: pr.outputState,
 						error: pr.error,
-						success: pr.stopped !== true && pr.interrupted !== true && pr.exitCode === 0,
+						success: pr.stopped !== true && pr.interrupted !== true && pr.exitCode === 0 && pr.execution?.status !== "partial",
 						exitCode: pr.interrupted === true ? 0 : pr.exitCode,
 						skipped: pr.skipped,
 						interrupted: pr.interrupted,
@@ -4313,6 +4501,8 @@ export async function runSubagent(
 						totalCost: pr.totalCost,
 						usage: pr.usage,
 						artifactPaths: pr.artifactPaths,
+						outputSaveError: pr.outputSaveError,
+						artifactOutputSaveFailed: pr.artifactOutputSaveFailed,
 						transcriptPath: pr.transcriptPath,
 						transcriptError: pr.transcriptError,
 							effects: pr.effects,
@@ -4569,6 +4759,8 @@ export async function runSubagent(
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking, attempt.contextLimit),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 				onExternalProcess: (process) => updateExternalProcess(flatIndex, process),
+				prepareExternalActivity: (externalCwd, signal) => prepareExternalActivity(flatIndex, externalCwd, signal),
+				onExternalStreamActivity: () => recordExternalStreamActivity(flatIndex),
 				onExternalJob: (externalJob) => updateExternalJob(flatIndex, externalJob),
 				skipAcceptance: () => timedOut || stopped || childStopRequests.has(flatIndex),
 				usageBudgetExhausted: continuationUsageBudgetExhausted,
@@ -4596,7 +4788,7 @@ export async function runSubagent(
 				output: stopped || childStopped ? stopMessage : timedOut ? singleResult.output || (timeoutMessage ?? "Subagent timed out.") : singleResult.output,
 				outputState: singleResult.outputState,
 				error: stopped || childStopped ? stopMessage : timedOut ? (timeoutMessage ?? "Subagent timed out.") : singleResult.error,
-				success: !stopped && !childStopped && !timedOut && singleResult.interrupted !== true && singleResult.exitCode === 0,
+				success: !stopped && !childStopped && !timedOut && singleResult.interrupted !== true && singleResult.exitCode === 0 && singleResult.execution?.status !== "partial",
 				exitCode: stopped || childStopped ? 1 : timedOut ? 1 : singleResult.interrupted === true ? 0 : singleResult.exitCode,
 				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
@@ -4609,6 +4801,8 @@ export async function runSubagent(
 				usage: singleResult.usage,
 				artifactPaths: singleResult.artifactPaths,
 				savedOutputPath: singleResult.savedOutputPath,
+				outputSaveError: singleResult.outputSaveError,
+				artifactOutputSaveFailed: singleResult.artifactOutputSaveFailed,
 				transcriptPath: singleResult.transcriptPath,
 				transcriptError: singleResult.transcriptError,
 				effects: singleResult.effects,
@@ -4673,7 +4867,7 @@ export async function runSubagent(
 
 			const stepEndTime = Date.now();
 			const childInterrupted = singleResult.interrupted === true;
-			requiredStatusStep(statusPayload, flatIndex).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
+			requiredStatusStep(statusPayload, flatIndex).status = stopped || childStopped ? "stopped" : timedOut ? "failed" : childInterrupted ? "paused" : singleResult.execution?.status === "partial" ? "partial" : singleResult.exitCode === 0 ? "complete" : "failed";
 			requiredStatusStep(statusPayload, flatIndex).endedAt = stepEndTime;
 			requiredStatusStep(statusPayload, flatIndex).durationMs = stepEndTime - stepStartTime;
 			requiredStatusStep(statusPayload, flatIndex).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
@@ -4802,6 +4996,34 @@ export async function runSubagent(
 		}
 	}
 
+	await Promise.all([...externalActivityEvidence.values()].map((evidence) => evidence.probeInFlight).filter((probe): probe is Promise<void> => probe !== undefined));
+	if (periodicGitProbeFailure) {
+		stopped = false;
+		timedOut = false;
+		interrupted = false;
+		delete statusPayload.stopped;
+		delete statusPayload.timedOut;
+		statusPayload.error = periodicGitProbeFailure.message;
+		const step = statusPayload.steps[periodicGitProbeFailure.index];
+		if (step) {
+			step.status = "failed";
+			step.error = periodicGitProbeFailure.message;
+			step.exitCode = 1;
+			delete step.stopped;
+			delete step.timedOut;
+		}
+		const result = results[periodicGitProbeFailure.index];
+		if (result) {
+			result.success = false;
+			result.exitCode = 1;
+			result.error = periodicGitProbeFailure.message;
+			result.output = periodicGitProbeFailure.message;
+			result.stopped = false;
+			result.timedOut = false;
+			result.interrupted = false;
+		}
+	}
+
 	let summary = results.map((r) => `${r.agent}:\n${r.output || (r.exitCode !== 0 ? r.error : undefined) || "(no output)"}`).join("\n\n");
 	let truncated = false;
 
@@ -4874,6 +5096,8 @@ export async function runSubagent(
 	if (!timedOut && !stopped && !interrupted && config.timeoutMs !== undefined && timeoutMessage !== undefined && results.some((result) => result.timedOut === true && result.error?.startsWith(timeoutMessage))) {
 		timedOut = true;
 	}
+	disposeControlInbox();
+	for (const request of consumeStopRequestPayloads(asyncDir)) stopChildStep(request);
 	const signalTerminated = !stopped && !timedOut && !interrupted && results.some((result) => result.exitCode !== 0 && isUnexplainedProcessSignal(omitUndefinedProperties({
 		processSignal: result.processSignal,
 		interrupted: result.interrupted,
@@ -4888,7 +5112,6 @@ export async function runSubagent(
 	});
 	statusPayload.state = stopped || signalTerminated ? "stopped" : timedOut || usageBudgetExceeded ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : partialWithEvidence ? "partial" : "failed";
 	closeSteerInbox(asyncDir, statusPayload.state, (filePath, payload) => runPersistence.write(filePath, payload));
-	disposeControlInbox();
 	for (const request of consumeSteerRequests(asyncDir)) deliverSteerRequest(request);
 	const effectiveSessionFile = sessionFile ?? latestSessionFile;
 	const steeringLifecycle = steeringStatus(statusPayload);
@@ -4924,7 +5147,7 @@ export async function runSubagent(
 		statusPayload.activityState = "needs_attention";
 		statusPayload.error = partialResult?.error ?? statusPayload.error;
 		for (const step of statusPayload.steps) {
-			if (step.status === "failed") step.activityState = "needs_attention";
+			if (step.status === "failed" || step.status === "partial") step.activityState = "needs_attention";
 		}
 	}
 	statusPayload.endedAt = runEndedAt;
@@ -4989,6 +5212,7 @@ export async function runSubagent(
 				artifactPaths: r.artifactPaths,
 				savedOutputPath: r.savedOutputPath,
 				outputSaveError: r.outputSaveError,
+				artifactOutputSaveFailed: r.artifactOutputSaveFailed,
 				metadataSaveError: r.metadataSaveError,
 				truncated: r.truncated,
 				transcriptPath: r.transcriptPath,
@@ -5124,7 +5348,7 @@ export async function runSubagent(
 async function waitForStartupControl(
 	controlPath: string,
 	token: string,
-	action: "ack" | "proceed",
+	action: "ack" | "confirm" | "proceed",
 	timeoutMs = 30_000,
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -5138,7 +5362,7 @@ async function waitForStartupControl(
 			}
 			if (payload.token !== token) throw new Error("Runner startup control token does not match.");
 			if (payload.action === action) return;
-			if (payload.action !== "ack" && payload.action !== "proceed") throw new Error("Runner startup control action is invalid.");
+			if (payload.action !== "ack" && payload.action !== "confirm" && payload.action !== "proceed") throw new Error("Runner startup control action is invalid.");
 		}
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
@@ -5175,6 +5399,8 @@ export async function runConfiguredSubagent(config: SubagentRunConfig, options?:
 			writeAtomicJson(startupPath, { state: "ready", token: lease.owner.token, pid: process.pid, owner: lease.owner });
 			await waitForStartupControl(startupAckPath, lease.owner.token, "ack");
 			writeAtomicJson(startupPath, { state: "acknowledged", token: lease.owner.token, pid: process.pid });
+			await waitForStartupControl(startupAckPath, lease.owner.token, "confirm");
+			writeAtomicJson(startupPath, { state: "confirmed", token: lease.owner.token, pid: process.pid });
 			await waitForStartupControl(startupProceedPath, lease.owner.token, "proceed");
 			startupCommitted = true;
 			for (const controlPath of [startupAckPath, startupProceedPath]) {

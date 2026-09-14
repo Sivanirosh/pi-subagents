@@ -171,11 +171,31 @@ describe("acceptance gates", () => {
 		assert.equal(formatAcceptancePrompt(dynamicReviewer), "");
 	});
 
-	it("preserves risky keyword review inference when acceptance role metadata is omitted", () => {
-		for (const task of ["Inspect the security posture", "Read-only security audit"]) {
-			const resolved = resolveEffectiveAcceptance({ agentName: "worker", task });
-			assert.equal(resolved.level, "checked", task);
-			assert.equal(resolved.review && resolved.review !== false ? resolved.review.required : undefined, true, task);
+	it("keeps read-only tasks out of writer acceptance despite risk keywords", () => {
+		for (const agentName of ["worker", "read-only-reviewer"]) {
+			for (const task of ["Review the security posture; do not edit files.", "Read-only security audit", "Read-only review. Verify release recovery; do not edit files."]) {
+				const resolved = resolveEffectiveAcceptance({ agentName, task, mode: "single", async: true });
+				assert.equal(resolved.level, "none", `${agentName}: ${task}`);
+				assert.deepEqual(resolved.criteria, []);
+				assert.equal(formatAcceptancePrompt(resolved), "");
+			}
+		}
+	});
+
+	it("retains risk gates for unknown tasks with review names or mixed inspection and writes", async () => {
+		for (const [agentName, task] of [
+			["worker", "Inspect the security posture"],
+			["analyst", "Handle the release."],
+			["release-analyst", "Handle the security rollout."],
+			["worker", "Inspect the release, then run prettier --write files."],
+			["worker", "Inspect the migration and migrate the data."],
+		]) {
+			const resolved = resolveEffectiveAcceptance({ agentName, task, mode: "single", async: true });
+			assert.equal(resolved.level, "checked", `${agentName}: ${task}`);
+			assert.equal(resolved.review && resolved.review.required, true);
+			assert.match(formatAcceptancePrompt(resolved), /Implement the requested change/);
+			const ledger = await evaluateAcceptance({ acceptance: resolved, output: "Done", cwd: process.cwd() });
+			assert.equal(ledger.status, "rejected", `${agentName}: ${task}`);
 		}
 	});
 
@@ -254,6 +274,16 @@ describe("acceptance gates", () => {
 		assert.match(prompt, /commandsRun\[\]\.result.*passed, failed, not-run/);
 		assert.match(prompt, /manualNotes.*optional strings.*empty string.*does not satisfy.*manual-notes/);
 		assert.match(prompt, /"reviewFindings": \[\n    "blocker:/);
+	});
+
+	it("labels declared review gates as optional when required is false", () => {
+		const optional = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement a fix",
+			explicit: { level: "checked", review: { agent: "reviewer", required: false } },
+		});
+
+		assert.match(formatAcceptancePrompt(optional), /Review gate: optional by reviewer\./);
 	});
 
 	it("omits inferred read-only prompts while preserving explicit acceptance", () => {
@@ -1238,6 +1268,7 @@ describe("acceptance gates", () => {
 			tasks: [
 				{ acceptance: { level: "checked", report: "off" } },
 				{ outputSchema: schema, acceptance: { level: "checked", report: "on" } },
+				{ outputSchema: false, acceptance: { level: "checked", report: "on" } },
 			],
 			chain: [
 				{ acceptance: { level: "checked", report: "on" } },
@@ -1250,6 +1281,7 @@ describe("acceptance gates", () => {
 		assert.deepEqual(errors, [
 			"acceptance.report requires outputSchema.",
 			"tasks[0].acceptance.report requires outputSchema.",
+			"tasks[2].acceptance.report requires outputSchema.",
 			"chain[0].acceptance.report requires outputSchema.",
 			"chain[2].parallel[0].acceptance.report requires outputSchema.",
 			"chain[3].parallel.acceptance.report requires outputSchema.",

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +12,68 @@ import { preflightWorkflowWorktrees } from "../../src/runs/foreground/subagent-e
 import { runSetupCommand } from "../../src/runs/shared/worktree-setup-command.ts";
 import { claimRunFanoutBatch, createRunFanoutBudget, getRunFanoutBudgetSnapshot } from "../../src/runs/shared/run-fanout-budget.ts";
 
+function nextChildMessage(child: ChildProcess, timeoutMs = 15_000): Promise<Record<string, unknown>> {
+	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			clearTimeout(timer);
+			child.off("message", onMessage);
+			child.off("error", onError);
+			child.off("exit", onExit);
+		};
+		const onMessage = (message: unknown) => { cleanup(); resolve(message as Record<string, unknown>); };
+		const onError = (error: Error) => { cleanup(); reject(error); };
+		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			cleanup();
+			reject(new Error(`workflow child exited before sending a message (code=${code ?? "null"}, signal=${signal ?? "null"})`));
+		};
+		const timer = setTimeout(() => {
+			cleanup();
+			reject(new Error(`timed out after ${timeoutMs}ms waiting for a workflow child message`));
+		}, timeoutMs);
+		child.once("message", onMessage);
+		child.once("error", onError);
+		child.once("exit", onExit);
+	});
+}
+
+async function stopChild(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	await new Promise<void>((resolve, reject) => {
+		child.once("exit", () => resolve());
+		child.once("error", reject);
+		child.kill();
+	});
+}
+
 describe("scripted workflow runtime", () => {
+	it("exposes supplied and executor-normalized empty arguments as deeply frozen values", async () => {
+		const launch = async (key: string) => ({ key, ok: true, output: "unused", artifactPaths: [] });
+		const status = async (key: string) => ({ key, ok: true, output: "unused", artifactPaths: [] });
+		const supplied = await runWorkflowScript({
+			script: `return { value: args.nested.items[0], rootFrozen: Object.isFrozen(args), nestedFrozen: Object.isFrozen(args.nested), arrayFrozen: Object.isFrozen(args.nested.items) };`,
+			args: { nested: { items: ["kept"] } },
+			launch,
+			status,
+		});
+		assert.deepEqual(supplied.value, { value: "kept", rootFrozen: true, nestedFrozen: true, arrayFrozen: true });
+
+		const omitted = await runWorkflowScript({ script: `return { args, frozen: Object.isFrozen(args) };`, launch, status });
+		assert.deepEqual(omitted.value, { args: {}, frozen: true });
+
+		const escape = await runWorkflowScript({
+			script: [
+				`const attempts = [args, args.nested, args.nested.items].map((value) => {`,
+				`  try { return value.constructor.constructor("return typeof process")(); } catch (error) { return error.constructor.name; }`,
+				`});`,
+				`return attempts;`,
+			].join("\n"),
+			args: { nested: { items: ["kept"] } },
+			launch,
+			status,
+		});
+		assert.deepEqual(escape.value, ["EvalError", "EvalError", "EvalError"], "args prototypes must belong to the VM realm so Function is blocked by codeGeneration.strings:false");
+	});
+
 	it("uses ordinary statement-body return semantics", async () => {
 		const implicit = await runWorkflowScript({
 			script: `({ answer: 42 });`,
@@ -3078,5 +3140,138 @@ describe("scripted workflow runtime", () => {
 		assert.equal(settledNotifications.length, 1, "should receive exactly 1 notification per child");
 		assert.equal(settledNotifications[0]!.childKey, "single-child");
 		assert.equal(settledNotifications[0]!.childRunId, "unique-run-id");
+	});
+
+	it("re-anchors a stale process cwd before creating the workflow worker", {
+		skip: process.platform === "win32" ? "Windows forbids deleting a live process cwd" : undefined,
+	}, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-stale-cwd-"));
+		const stale = path.join(root, "stale");
+		const valid = path.join(root, "valid");
+		fs.mkdirSync(stale);
+		fs.mkdirSync(valid);
+		const fixture = path.resolve("test/fixtures/cwd-workflow-child.ts");
+		const child = spawn(process.execPath, ["--experimental-strip-types", fixture], {
+			cwd: stale,
+			stdio: ["ignore", "ignore", "pipe", "ipc"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+		try {
+			const ready = await nextChildMessage(child) as { type?: string };
+			assert.equal(ready.type, "ready");
+			fs.rmSync(stale, { recursive: true });
+			child.send({ processCwd: valid });
+			const result = await nextChildMessage(child) as { ok?: boolean; value?: unknown; error?: string };
+			assert.equal(result.ok, true, result.error ?? stderr);
+			assert.equal(result.value, "recovered");
+		} finally {
+			await stopChild(child);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an unavailable recovery target without falling back from a stale cwd", {
+		skip: process.platform === "win32" ? "requires deleting a live process cwd, which Windows forbids" : undefined,
+	}, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-stale-cwd-failure-"));
+		const stale = path.join(root, "stale");
+		const missing = path.join(root, "missing");
+		fs.mkdirSync(stale);
+		const fixture = path.resolve("test/fixtures/cwd-workflow-child.ts");
+		const child = spawn(process.execPath, ["--experimental-strip-types", fixture], {
+			cwd: stale,
+			stdio: ["ignore", "ignore", "pipe", "ipc"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+		try {
+			const ready = await nextChildMessage(child);
+			assert.equal(ready.type, "ready");
+			fs.rmSync(stale, { recursive: true });
+			child.send({ processCwd: missing });
+			const result = await nextChildMessage(child);
+			assert.equal(result.ok, false, stderr);
+			assert.match(String(result.error), /Workflow process cwd is unavailable/);
+			assert.match(String(result.error), /ENOENT/);
+			assert.match(String(result.cause), /ENOENT/);
+		} finally {
+			await stopChild(child);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not chdir or expose the workflow target while launching from a healthy cwd", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-healthy-cwd-"));
+		const callerCwd = path.join(root, "caller");
+		const workflowCwd = path.join(root, "workflow");
+		fs.mkdirSync(callerCwd);
+		fs.mkdirSync(workflowCwd);
+		const expectedCallerCwd = fs.realpathSync(callerCwd);
+		const fixture = path.resolve("test/fixtures/cwd-workflow-child.ts");
+		const child = spawn(process.execPath, ["--experimental-strip-types", fixture], {
+			cwd: callerCwd,
+			stdio: ["ignore", "ignore", "pipe", "ipc"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+		try {
+			const ready = await nextChildMessage(child);
+			assert.equal(ready.cwd, expectedCallerCwd);
+			child.send({ processCwd: workflowCwd });
+			const result = await nextChildMessage(child);
+			assert.equal(result.ok, true, String(result.error ?? stderr));
+			assert.equal(result.chdirCalls, 0, "healthy launch must never invoke process.chdir");
+			assert.deepEqual(result.workerInitCwds, [expectedCallerCwd], "Worker init hooks must only observe the caller cwd");
+		} finally {
+			await stopChild(child);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an unavailable workflow process cwd before worker creation", async () => {
+		const missing = path.join(os.tmpdir(), `missing-workflow-cwd-${process.pid}`);
+		fs.rmSync(missing, { recursive: true, force: true });
+		const callerCwd = process.cwd();
+		await assert.rejects(
+			runWorkflowScript({
+				processCwd: missing,
+				script: `return "unexpected";`,
+				async launch(key) { return { key, ok: true, output: "unexpected", artifactPaths: [] }; },
+				async status(key) { return { key, ok: true, output: "unexpected", artifactPaths: [] }; },
+			}),
+			(error: unknown) => error instanceof Error
+				&& error.message.includes("Workflow process cwd is unavailable")
+				&& error.message.includes(missing)
+				&& error.message.includes("ENOENT")
+				&& error.cause instanceof Error
+				&& (error.cause as NodeJS.ErrnoException).code === "ENOENT",
+		);
+		assert.equal(process.cwd(), callerCwd, "a rejected workflow cwd must leave the caller cwd unchanged");
+	});
+
+	it("rejects healthy cwd targets that cannot be entered", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-invalid-cwd-"));
+		const file = path.join(root, "file");
+		const inaccessible = path.join(root, "inaccessible");
+		fs.writeFileSync(file, "not a directory");
+		fs.mkdirSync(inaccessible);
+		const run = (processCwd: string) => runWorkflowScript({
+			processCwd,
+			script: `return "unexpected";`,
+			async launch(key) { return { key, ok: true, output: "unexpected", artifactPaths: [] }; },
+			async status(key) { return { key, ok: true, output: "unexpected", artifactPaths: [] }; },
+		});
+		try {
+			await assert.rejects(run(file), (error: unknown) => error instanceof Error
+				&& error.message.includes(file)
+				&& error.cause instanceof Error
+				&& (error.cause as NodeJS.ErrnoException).code === "ENOTDIR");
+			const fixture = path.resolve("test/fixtures/workflow-cwd-access-failure.ts");
+			const result = spawnSync(process.execPath, ["--experimental-strip-types", fixture, inaccessible], { encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

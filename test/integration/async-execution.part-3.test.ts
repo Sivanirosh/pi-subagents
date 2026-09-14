@@ -11,11 +11,15 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ChildProcess } from "node:child_process";
+import { channel } from "node:diagnostics_channel";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { childSessionFactoryModule, setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import { createEventBus, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
-import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
+import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
+import { readPendingChainAppendRequests } from "../../src/runs/background/chain-append.ts";
+import { createRunFanoutBudget, getRunFanoutBudgetSnapshot, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
@@ -1074,8 +1078,10 @@ export default function() {
 	});
 
 	it("background single runs support outputSchema", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({ output: "structured", structuredOutput: { ok: true, note: "async" } });
+		const expectedStructuredOutput = { ok: true, note: "async" };
+		mockPi.onCall({ output: "", structuredOutput: expectedStructuredOutput });
 		const id = `async-single-schema-${Date.now().toString(36)}`;
+		const outputPath = path.join(tempDir, `${id}.json`);
 
 		executeAsyncSingle(id, {
 			agent: "worker",
@@ -1094,12 +1100,68 @@ export default function() {
 			sessionRoot: path.join(tempDir, "sessions"),
 			maxSubagentDepth: 2,
 			acceptance: false,
+			output: outputPath,
 			structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } },
 		});
 
 		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
 		assert.equal(payload.success, true);
-		assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true, note: "async" });
+		assert.deepEqual(payload.results[0]?.structuredOutput, expectedStructuredOutput);
+		assert.equal(payload.results[0]?.savedOutputPath, outputPath);
+		const savedOutput = fs.readFileSync(outputPath, "utf-8");
+		assert.equal(savedOutput, JSON.stringify(expectedStructuredOutput, null, 2));
+	});
+
+	it("background execution inherits a discovered agent outputSchema", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "typed.md"), `---\nname: typed\ndescription: Typed output\noutputSchema: {"type":"object","required":["ok"]}\n---\nReturn data.\n`);
+		const agents = discoverAgents(tempDir, "project").agents;
+		const executor = makeAsyncExecutor(agents);
+		const id = `async-schema-default-${Date.now().toString(36)}`;
+		mockPi.onCall({ output: "ordinary prose" });
+		const launch = await executor.execute(id, { agent: "typed", task: "Return data", async: true, runId: id, acceptance: false, artifacts: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+		assert.equal(launch.isError, undefined);
+		const payload = await readAsyncPayload(launch.details.asyncId!);
+		assert.equal(payload.success, false);
+		assert.match(payload.results[0]?.error ?? "", /Missing structured_output call/);
+	});
+
+	it("workflow acceptance uses inherited schemas and rejects a false opt-out", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "typed.md"), `---\nname: typed\ndescription: Typed output\noutputSchema: {"type":"object","required":["ok"]}\n---\nReturn data.\n`);
+		const executor = makeAsyncExecutor(discoverAgents(tempDir, "project").agents);
+		mockPi.onCall({ output: "ordinary prose" });
+		const inherited = await executor.execute("workflow-schema-default", {
+			async: false,
+			workflowScript: `return runs.run("typed", { agent: "typed", task: "Return data", acceptance: { level: "checked", report: "on" } });`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(inherited.isError, true);
+		assert.match(inherited.content[0]?.type === "text" ? inherited.content[0].text : "", /Missing structured_output call/);
+
+		const disabled = await executor.execute("workflow-schema-disabled", {
+			async: false,
+			workflowScript: `return runs.run("typed", { agent: "typed", task: "Return prose", outputSchema: false, acceptance: { level: "checked", report: "on" } });`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(disabled.isError, true);
+		assert.match(disabled.content[0]?.type === "text" ? disabled.content[0].text : "", /acceptance\.report requires outputSchema/);
+
+		mockPi.onCall({ output: "missing structured call" });
+		mockPi.onCall({ output: "false opted out" });
+		const parallel = await executor.execute("workflow-schema-parallel", {
+			async: false,
+			workflowScript: `const children = await runs.all([
+				{ key: "inherited", agent: "typed", task: "Return data", acceptance: false },
+				{ key: "disabled", agent: "typed", task: "Return prose", outputSchema: false, acceptance: false }
+			]); return children.map(({ key, ok, error, output }) => ({ key, ok, error, output }));`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(parallel.isError, undefined, parallel.content[0]?.type === "text" ? parallel.content[0].text : undefined);
+		const children = parallel.details.workflow?.value as Array<{ key: string; ok: boolean; error?: string; output: string }>;
+		assert.equal(children.find(({ key }) => key === "inherited")?.ok, false);
+		assert.match(children.find(({ key }) => key === "inherited")?.error ?? "", /Missing structured_output call/);
+		assert.deepEqual(children.find(({ key }) => key === "disabled"), { key: "disabled", ok: true, output: "false opted out" });
+		assert.equal(mockPi.callCount(), 3);
 	});
 
 	it("background outputSchema runs fail closed when required acceptanceReport is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1896,6 +1958,58 @@ export default function() {
 		}
 	});
 
+	it("append-step admits inherited schemas and rejects false report modes before enqueue", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
+		const runId = `append-effective-schema-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		const agentDir = path.join(tempDir, ".pi", "agents");
+		const schema = { type: "object", required: ["ok"] };
+		const budget = createRunFanoutBudget(runId, 8);
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.writeFileSync(path.join(agentDir, "typed.md"), `---\nname: typed\ndescription: Typed output\noutputSchema: ${JSON.stringify(schema)}\n---\nReturn data.\n`);
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId, sessionId: "session-123", mode: "chain", state: "running", startedAt: 100, lastUpdate: 200, cwd: tempDir, chainStepCount: 1,
+				steps: [{ agent: "typed", status: "running" }],
+			}, null, 2));
+			writeRunFanoutBudgetDescriptor(asyncDir, budget);
+			const executor = makeAsyncExecutor(discoverAgents(tempDir, "project").agents);
+			const ctx = makeMinimalCtx(tempDir);
+
+			const admitted = await executor.execute(
+				"append-inherited-schema",
+				{ action: "append-step", id: runId, step: { agent: "typed", task: "Review", acceptance: { level: "checked", report: "on" } } },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			) as AsyncExecutionResult;
+			assert.equal(admitted.isError, undefined, admitted.content[0]?.text ?? "append failed");
+			assert.match(admitted.content[0]?.text ?? "", /Append queued/);
+			const requests = readPendingChainAppendRequests(asyncDir);
+			assert.equal(requests.length, 1);
+			assert.deepEqual(requests[0]?.steps[0]?.structuredOutputSchema, schema);
+			assert.deepEqual(getRunFanoutBudgetSnapshot(budget), { used: 1, limit: 8, remaining: 7 });
+
+			for (const report of ["on", "off"] as const) {
+				const rejected = await executor.execute(
+					`append-false-schema-${report}`,
+					{ action: "append-step", id: runId, step: { agent: "typed", task: "Review", outputSchema: false, acceptance: { level: "checked", report } } },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				) as AsyncExecutionResult;
+				assert.equal(rejected.isError, true);
+				assert.match(rejected.content[0]?.text ?? "", /Cannot append step: chain\[0\]\.acceptance\.report requires outputSchema/);
+				assert.equal(readPendingChainAppendRequests(asyncDir).length, 1);
+				assert.deepEqual(getRunFanoutBudgetSnapshot(budget), { used: 1, limit: 8, remaining: 7 });
+				assert.equal(mockPi.callCount(), 0);
+			}
+		} finally {
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			fs.rmSync(budget.directory, { recursive: true, force: true });
+		}
+	});
+
 	it("background chains inherit the parent session model when no step or agent model is set", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Done asynchronously" });
 
@@ -2300,6 +2414,158 @@ export default function() {
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
 		assert.match(result.content[0]?.text ?? "", /async-cfg-/);
+	});
+
+	it("returns promptly when a revival runner exits before startup readiness", { timeout: 90_000, skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const sourceId = `async-revive-exit-before-ready-${Date.now().toString(36)}`;
+		const sessionFile = path.join(tempDir, "revival-exit-session.jsonl");
+		fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 1, id: "revival-exit-session", cwd: fs.realpathSync(tempDir) })}\n`);
+		mockPi.onCall({ output: "Initial work" });
+		executeAsyncSingle(sourceId, {
+			agent: "worker",
+			task: "Initial work",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-123" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionFile,
+			maxSubagentDepth: 2,
+		});
+		const initialResult = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(sourceId, 60_000), "utf8")) as { success: boolean };
+		assert.equal(initialResult.success, true);
+
+		const preloadFile = path.join(tempDir, "exit-before-ready.mjs");
+		fs.writeFileSync(preloadFile, `
+if (process.argv.some((arg) => arg.endsWith("subagent-runner.ts"))) process.exit(1);
+`);
+		const previousNodeOptions = process.env.NODE_OPTIONS;
+		const startedAt = Date.now();
+		let failed: AsyncExecutionResult;
+		try {
+			process.env.NODE_OPTIONS = [previousNodeOptions, `--import=${pathToFileURL(preloadFile).href}`].filter(Boolean).join(" ");
+			failed = await makeAsyncExecutor([makeAgent("worker", { completionGuard: false })]).execute(
+				"resume-exit-before-ready",
+				{ action: "resume", id: sourceId, message: "Continue" },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			) as AsyncExecutionResult;
+		} finally {
+			if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+			else process.env.NODE_OPTIONS = previousNodeOptions;
+		}
+		assert.equal(failed.isError, true);
+		assert.match(failed.content[0]?.text ?? "", /runner exited before startup state 'ready'/);
+		assert.ok(Date.now() - startedAt < 5_000, "runner exit must interrupt startup wait promptly");
+		const failedRun = fs.readdirSync(ASYNC_DIR).map((runId) => path.join(ASYNC_DIR, runId)).find((asyncDir) => {
+			try { return JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")).error?.includes("runner exited before startup state 'ready'"); } catch { return false; }
+		});
+		assert.ok(failedRun);
+		const failedStatus = JSON.parse(fs.readFileSync(path.join(failedRun, "status.json"), "utf8")) as { processTerminal?: unknown };
+		const failedTerminal = JSON.parse(fs.readFileSync(path.join(failedRun, "process-terminal.json"), "utf8"));
+		assert.deepEqual(failedStatus.processTerminal, failedTerminal, "status and terminal proof must agree after an early runner exit");
+	});
+
+	it("does not proceed when a real revival runner exits after acknowledgement", async () => {
+		const id = `acknowledged-runner-closure-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const sessionId = `session-${id}`;
+		const sessionFile = path.join(tempDir, `${id}.jsonl`);
+		fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 1, id: `child-${id}`, cwd: fs.realpathSync(tempDir) })}\n`);
+		const capacity = acquireActiveAsyncCapacity({ sessionId, limit: 1, runId: id, kind: "runner", asyncDir });
+		assert.ok(capacity);
+		const eventsSeen: string[] = [];
+		const processEvents: Array<{ type: "exit" | "close"; exitCode: number | null; signal: NodeJS.Signals | null }> = [];
+		let runnerProcess: ChildProcess | undefined;
+		let terminalEmission: { proof: unknown; status: unknown; candidate: unknown } | undefined;
+		const childProcessChannel = channel("child_process");
+		const observeProcess = (message: unknown) => {
+			const proc = (message as { process?: unknown }).process;
+			if (!(proc instanceof ChildProcess) || runnerProcess !== undefined) return;
+			runnerProcess = proc;
+			proc.once("exit", (exitCode, signal) => { processEvents.push({ type: "exit", exitCode, signal }); });
+			proc.once("close", (exitCode, signal) => { processEvents.push({ type: "close", exitCode, signal }); });
+		};
+		const preloadFile = path.join(tempDir, `${id}-exit-after-ack.mjs`);
+		fs.writeFileSync(preloadFile, `
+import { createRequire, syncBuiltinESMExports } from "node:module";
+const require = createRequire(import.meta.url);
+const fs = require("node:fs");
+const originalRenameSync = fs.renameSync;
+fs.renameSync = function(source, destination) {
+	const result = originalRenameSync.apply(this, arguments);
+	if (String(destination).endsWith("runner-startup.json")) {
+		try {
+			if (JSON.parse(fs.readFileSync(destination, "utf8")).state === "acknowledged") process.exit(42);
+		} catch {}
+	}
+	return result;
+};
+syncBuiltinESMExports();
+`);
+		const callsBefore = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).length;
+		const previousNodeOptions = process.env.NODE_OPTIONS;
+		childProcessChannel.subscribe(observeProcess);
+		let result: AsyncExecutionResult;
+		try {
+			process.env.NODE_OPTIONS = [previousNodeOptions, `--import=${pathToFileURL(preloadFile).href}`].filter(Boolean).join(" ");
+			result = await Promise.resolve(executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Must never start",
+				agentConfig: makeAgent("worker", { completionGuard: false }),
+				ctx: { pi: { events: { emit(type: string, proof: unknown) {
+					eventsSeen.push(type);
+					if (type === "subagent:process-terminal" && (proof as { runId?: unknown }).runId === id) {
+						terminalEmission = {
+							proof,
+							status: JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")),
+							candidate: JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal-candidate.json"), "utf8")),
+						};
+					}
+				} } }, cwd: tempDir, currentSessionId: sessionId },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionFile,
+				revivalLease: { sessionFile, runId: id, sourceRunId: `source-${id}`, parentSessionId: sessionId },
+				activeAsyncCapacity: capacity,
+				maxSubagentDepth: 2,
+			}));
+		} finally {
+			childProcessChannel.unsubscribe(observeProcess);
+			if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+			else process.env.NODE_OPTIONS = previousNodeOptions;
+		}
+		assert.equal(result.isError, true);
+		assert.deepEqual(result.details.results, []);
+		const runnerPid = runnerProcess?.pid;
+		assert.equal(typeof runnerPid, "number");
+		assert.deepEqual(processEvents, [
+			{ type: "exit", exitCode: 42, signal: null },
+			{ type: "close", exitCode: 42, signal: null },
+		]);
+		assert.equal(eventsSeen.includes("subagent:async-started"), false);
+		assert.equal(fs.existsSync(path.join(asyncDir, "runner-startup-proceed.json")), false);
+		assert.equal(fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).length, callsBefore, "child session must not start");
+		assert.equal(getActiveAsyncCapacitySnapshot(sessionId, 1).used, 0, "launch failure must roll capacity back automatically");
+		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8"));
+		const terminal = JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf8"));
+		assert.equal(status.state, "failed");
+		assert.equal(typeof status.error, "string");
+		assert.match(status.error, /exited before startup state '(?:acknowledged|confirmed)' \(exit code 42, signal none\)/);
+		assert.equal(result.content[0]?.text, `Failed to start async run '${id}': ${status.error}`);
+		assert.equal(status.pid, runnerPid);
+		assert.equal(terminal.state, "observed");
+		assert.equal(terminal.runId, id);
+		assert.equal(terminal.runnerProcessInstanceId, terminalEmission && (terminalEmission.candidate as { runnerProcessInstanceId?: unknown }).runnerProcessInstanceId);
+		assert.deepEqual(terminal.instances, [{ kind: "runner", processInstanceId: terminal.runnerProcessInstanceId, closeObservedAt: terminal.instances[0].closeObservedAt, exitCode: 42, signal: null }]);
+		assert.deepEqual(status.processTerminal, terminal);
+		assert.deepEqual(terminalEmission && terminalEmission.proof, terminal);
+		assert.equal(terminalEmission && (terminalEmission.status as { state?: unknown }).state, "failed");
+		assert.equal(terminalEmission && (terminalEmission.status as { error?: unknown }).error, status.error);
+		assert.deepEqual(terminalEmission && (terminalEmission.status as { processTerminal?: unknown }).processTerminal, terminal);
+		assert.ok(terminalEmission);
+		assert.equal(Object.values((terminalEmission.candidate as { expectedWriters: Record<string, number> }).expectedWriters).every((count) => count === 0), true);
+		assert.equal(fs.existsSync(path.join(RESULTS_DIR, `${id}.json`)), false, "a pre-proceed exit must not publish a result");
 	});
 
 });

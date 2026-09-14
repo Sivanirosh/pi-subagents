@@ -612,6 +612,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	start: () => void;
 	activateTransport: () => void;
 	findPendingAsks: (target: { runId: string; agent: string; childIndex: number }) => string[];
+	hasPendingRequests: () => boolean;
 	dispose: () => void;
 	pending: Map<string, PendingSupervisorRequest>;
 	getSupervisorRequestState: (event: ControlEvent) => SupervisorRequestState;
@@ -732,11 +733,15 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 				continue;
 			}
 			seenFiles.add(file);
-			if (request.expectsReply) {
-				rememberPendingRequest(request);
-				pending.set(request.id, request);
-				markForegroundSupervisorAttention(request, state);
+			if (!request.expectsReply) {
+				// Progress is already visible through child activity; do not inject a
+				// parent message or trigger a parent model turn.
+				removeRequestFile(request.requestFile);
+				continue;
 			}
+			rememberPendingRequest(request);
+			pending.set(request.id, request);
+			markForegroundSupervisorAttention(request, state);
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
 			try {
@@ -755,25 +760,19 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						...(request.childTarget ? { childTarget: request.childTarget } : {}),
 						...(request.interview !== undefined ? { interview: request.interview } : {}),
 						requestBody: request.message,
-						...(request.expectsReply ? { replyHint: supervisorReplyHint(request.id) } : {}),
+						replyHint: supervisorReplyHint(request.id),
 					},
 				}, { triggerTurn: true });
-				// sendMessage accepts synchronously; one-way updates stay on disk until it returns.
-				if (!request.expectsReply) removeRequestFile(request.requestFile);
 			} catch (error) {
-				// Allow an existing later scan to retry an unaccepted one-way update.
-				if (!request.expectsReply) seenFiles.delete(file);
 				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}
-			if (request.expectsReply) {
-				(pi as { events?: IntercomEventBus }).events?.emit(INTERCOM_DETACH_REQUEST_EVENT, {
-					requestId: request.id,
-					runId: request.runId,
-					agent: request.agent,
-					childIndex: request.childIndex,
-				});
-				if (pending.has(request.id)) markForegroundSupervisorAttention(request, state);
-			}
+			(pi as { events?: IntercomEventBus }).events?.emit(INTERCOM_DETACH_REQUEST_EVENT, {
+				requestId: request.id,
+				runId: request.runId,
+				agent: request.agent,
+				childIndex: request.childIndex,
+			});
+			if (pending.has(request.id)) markForegroundSupervisorAttention(request, state);
 		}
 		channels?.retire?.();
 	};
@@ -859,6 +858,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 					&& request.agent === target.agent && request.childIndex === target.childIndex
 					&& requestLifecycle(request, state, now, runState(request)) === "pending" ? [request.id] : [];
 			}).sort();
+		},
+		hasPendingRequests: () => {
+			if (!started) return false;
+			poll();
+			return pending.size > 0;
 		},
 		start: () => {
 			if (started) return;

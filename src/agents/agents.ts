@@ -8,7 +8,7 @@ import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, OutputMode, ToolBudgetConfig } from "../shared/types.ts";
+import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, JsonSchemaObject, OutputMode, ToolBudgetConfig } from "../shared/types.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, parseExternalCliCapabilityNarrowing, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import { expandHomePath } from "../shared/settings.ts";
@@ -24,6 +24,7 @@ import { parseMemoryFrontmatter } from "./agent-memory.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { validatePermissionRules, type PermissionRules } from "../runs/shared/permissions.ts";
 import { parseThinkingLevel, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
+import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -170,6 +171,7 @@ export interface AgentConfig {
 	mutationTools?: string[];
 	output?: string;
 	outputMode?: OutputMode;
+	outputSchema?: JsonSchemaObject;
 	defaultReads?: string[];
 	defaultProgress?: boolean;
 	interactive?: boolean;
@@ -705,12 +707,20 @@ function effectiveAgentMatch(matches: AgentConfig[]): { agent?: AgentConfig; err
 
 export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?: AgentConfig; error?: string } {
 	const raw = name.trim();
-	const exact = agents.filter((agent) => agent.name === raw || agent.localName === raw);
-	if (exact.length === 1) return exact[0] ? { agent: exact[0] } : {};
-	if (exact.length > 1) {
-		const effective = effectiveAgentMatch(exact);
+	const canonical = agents.filter((agent) => agent.name === raw);
+	if (canonical.length === 1) return canonical[0] ? { agent: canonical[0] } : {};
+	if (canonical.length > 1) {
+		const effective = effectiveAgentMatch(canonical);
 		if (effective.agent) return effective;
-		return { error: `Ambiguous agent name '${name}': ${exact.map((agent) => agent.name).join(", ")}` };
+		return { error: `Ambiguous agent name '${name}': ${canonical.map((agent) => agent.name).join(", ")}` };
+	}
+
+	const local = agents.filter((agent) => agent.localName === raw);
+	if (local.length === 1) return local[0] ? { agent: local[0] } : {};
+	if (local.length > 1) {
+		const effective = effectiveAgentMatch(local);
+		if (effective.agent) return effective;
+		return { error: `Ambiguous local agent name '${name}': ${local.map((agent) => agent.name).join(", ")}` };
 	}
 
 	const aliases = agents.filter((agent) => agent.aliases?.includes(raw));
@@ -831,8 +841,17 @@ function isProjectRootCandidate(dir: string): boolean {
 
 function findProjectRootCandidates(cwd: string): string[] {
 	const roots: string[] = [];
+	const windowsProfile = process.env.HOMEDRIVE && process.env.HOMEPATH
+		? `${process.env.HOMEDRIVE}${process.env.HOMEPATH}`
+		: undefined;
+	const homeDirs = new Set([os.homedir(), process.env.HOME, process.env.USERPROFILE, windowsProfile]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.filter(isDirectory)
+		.map((value) => fs.realpathSync.native(value)));
 	let currentDir = cwd;
 	while (true) {
+		// ~/.pi and ~/.agents are user configuration, never an implicit project.
+		if (isDirectory(currentDir) && homeDirs.has(fs.realpathSync.native(currentDir))) return roots;
 		if (isProjectRootCandidate(currentDir)) roots.push(currentDir);
 
 		const parentDir = path.dirname(currentDir);
@@ -2138,6 +2157,12 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			}
 			toolBudget = parsed as ToolBudgetConfig;
 		}
+		let outputSchema: JsonSchemaObject | undefined;
+		if (frontmatter.outputSchema !== undefined && frontmatter.outputSchema.trim()) {
+			const parsed: unknown = JSON.parse(frontmatter.outputSchema);
+			assertJsonSchemaObject(parsed, `Agent '${localName}' outputSchema`);
+			outputSchema = parsed;
+		}
 		const completionGuard = frontmatter.completionGuard === "false"
 			? false
 			: frontmatter.completionGuard === "true"
@@ -2190,6 +2215,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			...(machine !== undefined ? { machine } : {}),
 			...(frontmatter.output !== undefined ? { output: frontmatter.output } : {}),
 			...(outputMode !== undefined ? { outputMode } : {}),
+			...(outputSchema !== undefined ? { outputSchema } : {}),
 			...(defaultReads?.length ? { defaultReads } : {}),
 			defaultProgress: frontmatter.defaultProgress === "true",
 			interactive: frontmatter.interactive === "true",

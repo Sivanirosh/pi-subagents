@@ -236,7 +236,7 @@ Disable and restore:
 
 ## Running external CLI agents on a Herdr saved machine
 
-The six code-owned external-cli profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). The local parent spawns `ssh -T <target>`, retaining prompt delivery, stream parsing, stop, and exit proof. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
+Native Pi and the six code-owned Claude Code, Codex, and Cursor profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). Herdr owns each visible agent process in a fresh no-focus pane; SSH is used only as bounded transport for Herdr RPC and ownership checks. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
 
 `machine` is a top-level frontmatter key, a settings override (`subagents.agentOverrides.<agent>.machine`, project beats user, `false` clears a pin), and a launch option on the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. The launch option wins. Placement survives `subagent({ action: "disable" })`, `reset`, and model profile switches.
 
@@ -246,16 +246,16 @@ The six code-owned external-cli profiles can run on a Herdr machine (`herdr mach
 {
   "subagents": {
     "agentOverrides": { "claude-code": { "machine": "workmac" } },
-    "machines": { "workmac": { "cwd": "/home/nico/proj", "env": { "CLAUDE_CONFIG_DIR": "/home/nico/.claude-work" } } }
+    "machines": { "workmac": { "cwd": "/home/nico/proj" } }
   }
 }
 ```
 
-`machines.<label-or-id>.env` is optional and is exported in front of the remote command. Nothing else crosses: the local ssh process receives only `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and no local API key is copied. Remote runs use the machine's own credentials, so log in to the CLI on that machine once. Non-interactive ssh shells skip rc files, so `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin` are prepended to the remote `PATH`; for anything else set the agent's `command` to the absolute path on the machine.
+`machines.<label-or-id>.env` is rejected. No local API key, vendor environment, expanded prompt resource, extension path, or callback is copied. Remote runs use the machine's own credentials and managed model registry. Bounded probes and ownership checks use a fixed machine-owned PATH without sourcing shell profiles.
 
-Remote `--version` and `--help` probes use a ready marker to discard rc-file noise. Runs share one OpenSSH ControlMaster socket per machine (`~/.pi/agent/ssh-control/`, `ControlPersist=60`). Status, receipts, and FleetView carry the machine identity, remote cwd, and remote git state; writer results state that changes are remote.
+Placed external profiles are one-shot and stop-only: they cannot steer, resume, or claim a Pi supervisor. Their result is always `partial` and begins `[best-effort/unverified]`, because only bounded sanitized terminal snapshots are exposed; no vendor-private transcript, database, JSONL, or blob is used as authoritative settlement evidence. Reconnect observes the same pane and process without redispatching the prompt.
 
-pi-subagents never clones, pulls, or checks out on the machine; a missing directory fails the remote `cd` with a hint. Native Pi agents, generic `external-cli` commands, managed worktrees, and Windows hosts are rejected before launch. Codex's final message and Cursor's handoff file use the ssh stream and remote temp files, not local paths.
+pi-subagents never clones, pulls, or checks out on the machine. Generic `external-cli` commands and managed worktrees are rejected before launch; saved-machine placement accepts native Pi and only the six code-owned external profiles.
 
 ## Parent prompt discovery
 
@@ -528,15 +528,15 @@ Agent-local `skillPath` candidates never enter Pi's parent/global skills catalog
 
 ## The bundled pi-subagents skill
 
-The package bundles a `pi-subagents` skill that is automatically available to the parent agent when the extension is installed. It is for the orchestrating parent only: child subagents never receive it, and their context is explicitly filtered to strip parent-only orchestration instructions.
+The package bundles a `pi-subagents` skill that is automatically available to the parent agent when the extension is installed. Availability is not automatic routing or permission to delegate: the parent works directly unless the operator requests delegation in the current request or through applicable user/project instructions. Once authorized, use the smallest bounded child or workflow whose evidence, independent review, specialization, parallelism, or isolation benefit earns its overhead. It is for the orchestrating parent only: child subagents never receive it, and their context is explicitly filtered to strip parent-only orchestration instructions.
 
 What it covers:
 
-- **Delegation patterns**: when to launch which agent, whether to use single, parallel, chain, or async mode, and whether to use fresh or forked context.
+- **Delegation patterns**: how to select a bounded agent and single, parallel, scripted, or async shape after delegation is authorized, including fresh or forked context.
 - **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command. This includes parallel review, review-loop, parallel research, parallel context-build, parallel handoff-plan, gather-context-and-clarify, and parallel cleanup.
 - **Role-agent prompting guidance**: compact contract prompts instead of long scripts, what to include in role-specific meta prompts, and retrieval budgets for researchers.
 - **Safety boundaries**: child agents must not run subagents unless their resolved builtin tools explicitly include `subagent`, must not invent intercom targets, and must escalate unapproved decisions.
 - **Intercom conventions**: when to ask vs send, and how parent-side supervisor/result delivery works through the native channel.
 - **Control and diagnostics**: attention signals, soft interrupts, status, and the `doctor` action.
 
-If you are writing an agent that orchestrates subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.
+If you are writing an agent that has been asked to orchestrate subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.

@@ -43,6 +43,7 @@ function enabledConfig(overrides: Partial<ResolvedWatchdogConfig> = {}): Resolve
 function warning(): WatchdogWarning {
 	return {
 		severity: "concern",
+		importance: "high",
 		summary: "Runtime concern",
 		evidence: "The runtime test emitted a concern.",
 		recommendedAction: "Review the displayed warning before accepting the turn.",
@@ -387,6 +388,28 @@ describe("main watchdog runtime", () => {
 		assert.equal((displayed[0] as { state?: string }).state, "displayed");
 	});
 
+	it("routes low and medium findings only to persisted user entries, independent of severity", async () => {
+		for (const severity of ["concern", "blocker"] as const) {
+			for (const importance of ["low", "medium", "high"] as const) {
+				const messages: WatchdogWarningDetails[] = [];
+				const entries: WatchdogWarningDetails[] = [];
+				const runtime = new MainWatchdogRuntime({
+					resolveConfig: () => configResult(enabledConfig()),
+					review: (request) => {
+						request.emitWarning({ ...warning(), severity, importance, summary: `${severity}-${importance}` });
+						return { stopReason: "stop" };
+					},
+					displayWarning: (details) => messages.push(details),
+					displayUserWarning: (details) => entries.push(details),
+				});
+				runtime.enqueueDelta("Assistant:\nWorking");
+				await runtime.handleAgentEnd({}, { cwd: "/tmp/project" });
+				assert.equal(messages.length, importance === "high" ? 1 : 0);
+				assert.equal(entries.length, importance === "high" ? 0 : 1);
+			}
+		}
+	});
+
 	it("drops stale async warning callbacks after reset", async () => {
 		let emitWarning!: (candidate: WatchdogWarning) => boolean;
 		let finishReview!: () => void;
@@ -429,6 +452,25 @@ describe("main watchdog runtime", () => {
 		assert.equal(snapshot.status, "failed");
 		assert.match(snapshot.lastError ?? "", /stop reason 'length'/);
 		assert.equal(snapshot.failedReviews, 1);
+	});
+
+	it("surfaces the provider error text of a failed review in lastError", async () => {
+		const diagnostic = `provider-head-${"H".repeat(400)}-middle-${"M".repeat(400)}-provider-tail`;
+		const runtime = new MainWatchdogRuntime({
+			resolveConfig: () => configResult(enabledConfig()),
+			review: () => ({ stopReason: "error", errorMessage: diagnostic }),
+		});
+
+		runtime.enqueueDelta("Assistant:\nWorking");
+		await runtime.handleAgentEnd({ type: "agent_end", messages: [] }, { cwd: "/tmp/project" });
+
+		const snapshot = runtime.getSnapshot();
+		assert.equal(snapshot.status, "failed");
+		const lastError = snapshot.lastError ?? "";
+		assert.ok(lastError.includes(diagnostic.slice(0, 150)));
+		assert.ok(lastError.includes(`[... about ${diagnostic.length - 600} characters omitted ...]`));
+		assert.ok(lastError.endsWith(diagnostic.slice(-100)));
+		assert.ok(!lastError.includes(diagnostic));
 	});
 
 	it("marks unresolved agent-end review work stale on timeout", async () => {
