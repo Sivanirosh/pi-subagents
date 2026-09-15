@@ -24,6 +24,8 @@ export interface ChildWatchdogConfig {
 	stalemateRepeats: number;
 	/** Mid-run review cadence; everyNTools null means boundary reviews only. */
 	cadence: WatchdogCadenceConfig;
+	/** Internal prototype seed; populated only by the native foreground launch. */
+	liveAdvisorSeedSessionFile?: string;
 }
 
 export interface ChildWatchdogStatusEvent {
@@ -47,15 +49,17 @@ export function resolveChildWatchdogConfig(input: {
 	agent?: string;
 	runId?: string;
 	childIndex?: number;
+	liveAdvisorSeedSessionFile?: string;
+	forceLiveAdvisor?: boolean;
 }): ChildWatchdogConfig | undefined {
 	const override = input.agent ? input.config.children.overrides[input.agent] : undefined;
-	const enabled = input.config.enabled && (override?.enabled ?? input.config.children.enabled);
+	const enabled = input.forceLiveAdvisor === true || (input.config.enabled && (override?.enabled ?? input.config.children.enabled));
 	if (!enabled) return undefined;
-	const model = override?.model ?? input.config.children.model;
-	const fallbackModels = override?.fallbackModels ?? input.config.children.fallbackModels;
-	const thinking = override?.thinking ?? input.config.children.thinking;
+	const model = input.forceLiveAdvisor ? "openai-codex/gpt-6-astra" : override?.model ?? input.config.children.model;
+	const fallbackModels = input.forceLiveAdvisor ? [] : override?.fallbackModels ?? input.config.children.fallbackModels;
+	const thinking = input.forceLiveAdvisor ? "xhigh" : override?.thinking ?? input.config.children.thinking;
 	const blockOnFailure = override?.blockOnFailure ?? input.config.children.blockOnFailure;
-	const cadence = override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
+	const cadence = input.forceLiveAdvisor ? { everyNTools: 1 } : override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
 	return {
 		...(input.runId ? { runId: input.runId } : {}),
 		...(input.agent ? { agent: input.agent } : {}),
@@ -70,6 +74,7 @@ export function resolveChildWatchdogConfig(input: {
 		lsp: { ...input.config.lsp },
 		stalemateRepeats: input.config.stalemateRepeats,
 		cadence: { everyNTools: cadence.everyNTools ?? null },
+		...(input.liveAdvisorSeedSessionFile ? { liveAdvisorSeedSessionFile: input.liveAdvisorSeedSessionFile } : undefined),
 	};
 }
 

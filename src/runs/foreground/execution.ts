@@ -384,12 +384,14 @@ async function runSingleAttempt(
 	// this run without reading the child's session file.
 	const childSessionName = deriveChildSessionName({ agent: agent.name, task: shared.originalTask ?? task });
 	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
+	if (options.liveAdvisorSeedSessionFile && !watchdogConfig.ok) throw new Error(`liveAdvisor requires a valid per-job watchdog configuration: ${watchdogConfig.errors.map((error) => error.message).join("; ")}`);
 	const childWatchdog = watchdogConfig.ok
 		? resolveChildWatchdogConfig({
 			config: watchdogConfig.config,
 			agent: agent.name,
 			runId: options.runId,
 			childIndex: options.index ?? 0,
+			...(options.liveAdvisorSeedSessionFile ? { liveAdvisorSeedSessionFile: options.liveAdvisorSeedSessionFile, forceLiveAdvisor: true } : undefined),
 		})
 		: undefined;
 	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);
@@ -1057,6 +1059,12 @@ async function runSingleAttempt(
 				});
 				if (!next) return;
 				updateChildWatchdogState(next);
+				if (childWatchdog?.liveAdvisorSeedSessionFile && (next.phase === "failed" || next.phase === "stale")) {
+					result.error = next.reason ?? "Live advisor failed; worker was cancelled.";
+					progress.status = "failed";
+					progress.error = result.error;
+					abortChild();
+				}
 				if (childWatchdogIsActive(next)) {
 					clearFinalDrainTimers();
 					armWatchdogTail();

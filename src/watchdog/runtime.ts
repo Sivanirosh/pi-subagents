@@ -92,6 +92,10 @@ interface MainWatchdogRuntimeOptions {
 	reviewChangesOnly?: boolean;
 	lspDiagnostics?: WatchdogLspDiagnosticsFunction;
 	repoChangeSignature?: typeof computeWatchdogRepoChangeSignature;
+	/** Prototype-only immediate cancellation notification for a failed/stale advisor review. */
+	onReviewFailure?: (reason: string, status: "failed" | "stale") => void;
+	/** Persistent reviewers retain submitted deltas in their conversation. */
+	incrementalReviewDeltas?: boolean;
 }
 
 export type WatchdogWarningSendOptions = { deliverAs: "steer" } | { triggerTurn: false };
@@ -138,6 +142,9 @@ export class MainWatchdogRuntime {
 	private readonly reviewChangesOnly: boolean;
 	private readonly lspDiagnostics: WatchdogLspDiagnosticsFunction;
 	private readonly repoChangeSignature: typeof computeWatchdogRepoChangeSignature;
+	private readonly onReviewFailure: MainWatchdogRuntimeOptions["onReviewFailure"];
+	private readonly incrementalReviewDeltas: boolean;
+	private midRunReview: Promise<void> | undefined;
 	private readonly lspLedger = new WatchdogLspDiagnosticsLedger();
 	private readonly scope = new WatchdogScopeArtifact();
 	private configResult: WatchdogSettingsResult;
@@ -197,6 +204,8 @@ export class MainWatchdogRuntime {
 		this.reviewChangesOnly = options.reviewChangesOnly === true;
 		this.lspDiagnostics = options.lspDiagnostics ?? collectWatchdogLspDiagnostics;
 		this.repoChangeSignature = options.repoChangeSignature ?? computeWatchdogRepoChangeSignature;
+		this.onReviewFailure = options.onReviewFailure;
+		this.incrementalReviewDeltas = options.incrementalReviewDeltas === true;
 		this.configResult = this.resolveConfig(this.cwd);
 		this.guardMaxWarnings = this.configResult.config.maxWarnings;
 		this.guard = new WatchdogEmissionGuard({ maxWarnings: this.guardMaxWarnings });
@@ -387,9 +396,11 @@ export class MainWatchdogRuntime {
 		this.toolResultsThisRun++;
 		if (this.toolResultsThisRun % everyNTools !== 0) return;
 		if (this.reviewing || this.waitingAtAgentEnd || this.midRunReviewing) return;
+		if (this.incrementalReviewDeltas && this.pendingDeltas.length === 0) return;
 		const delta = this.buildReviewInput(undefined, "");
 		if (!delta.trim()) return;
-		void this.reviewMidRunDelta(delta);
+		if (this.incrementalReviewDeltas) this.clearPendingDeltas();
+		this.midRunReview = this.reviewMidRunDelta(delta);
 	}
 
 	async handleAgentEnd(_event: unknown, ctx: ContextLike): Promise<void> {
@@ -406,7 +417,13 @@ export class MainWatchdogRuntime {
 			this.resolveWaiters(true);
 			return;
 		}
-		this.cancelMidRunReview();
+		if (this.incrementalReviewDeltas) {
+			// Finish the submitted delta before reusing its advisor conversation at the boundary.
+			const epoch = this.epoch;
+			await this.midRunReview;
+			if (this.disposed || this.epoch !== epoch || ctx.signal?.aborted || !this.isEnabled()) return;
+			if (this.status === "failed" || this.status === "stale") return;
+		} else this.cancelMidRunReview();
 		if (activityReview && (!changeSignature || knownEvidence)) this.activityReviewUsed = true;
 		this.activityPending = false;
 		this.waitingAtAgentEnd = true;
@@ -595,16 +612,17 @@ export class MainWatchdogRuntime {
 		if (this.midRunReviewing || this.reviewing || this.waitingAtAgentEnd || this.disposed) return;
 		this.midRunReviewing = true;
 		const generation = this.midRunGeneration;
+		const epoch = this.epoch;
 		try {
 			const outcome = await this.reviewDelta(delta, this.configResult.config.agentEndTimeoutMs, { correction: true });
-			if (generation !== this.midRunGeneration) return;
+			if (this.disposed || epoch !== this.epoch || generation !== this.midRunGeneration) return;
 			if (outcome === "timeout") {
 				this.staleReviews++;
 				this.status = "stale";
 				this.markLastWarningStale();
 			}
 		} finally {
-			if (generation === this.midRunGeneration) {
+			if (!this.disposed && epoch === this.epoch && generation === this.midRunGeneration) {
 				this.midRunReviewing = false;
 				if (this.status === "reviewing") this.status = this.pendingDeltas.length ? "queued" : "idle";
 				this.resolveWaiters(this.isSettled());
@@ -654,11 +672,12 @@ export class MainWatchdogRuntime {
 					timeout = setTimeout(() => resolve("timeout"), timeoutMs);
 				}),
 			]);
+			if (!this.isCurrent(reviewEpoch, reviewId)) return "stale";
 			if (result === "timeout") {
 				abortController.abort();
+				this.onReviewFailure?.("Watchdog review timed out.", "stale");
 				return "timeout";
 			}
-			if (!this.isCurrent(reviewEpoch, reviewId)) return "stale";
 			if (!result) return "stale";
 			if (allowClarification && this.configResult.config.clarification && result.clarification && (!result.stopReason || result.stopReason === "stop") && !this.activeReviewWarning && !result.warnings?.length && !abortController.signal.aborted) {
 				const question = result.clarification.question.trim();
@@ -671,14 +690,18 @@ export class MainWatchdogRuntime {
 			for (const warning of result.warnings ?? []) this.acceptWarning(reviewEpoch, reviewId, warning);
 			if (result.stopReason && result.stopReason !== "stop") {
 				const detail = result.errorMessage?.trim() ? ` ${boundWatchdogReviewText(result.errorMessage.trim(), 600)}` : "";
-				this.fail(`Watchdog review ended with stop reason '${result.stopReason}'.${detail}`);
+				const reason = `Watchdog review ended with stop reason '${result.stopReason}'.${detail}`;
+				this.fail(reason);
+				this.onReviewFailure?.(reason, "failed");
 				return "completed";
 			}
 			this.displayAcceptedReviewWarning(options.correction);
 			return "completed";
 		} catch (error) {
 			if (this.isCurrent(reviewEpoch, reviewId)) {
-				this.fail(`Watchdog review failed: ${errorMessage(error)}`);
+				const reason = `Watchdog review failed: ${errorMessage(error)}`;
+				this.fail(reason);
+				this.onReviewFailure?.(reason, "failed");
 				return "completed";
 			}
 			return "stale";

@@ -1,5 +1,6 @@
-import { Agent, type AgentTool, type StreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createReadOnlyTools, convertToLlm, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Agent, type AgentMessage, type AgentTool, type StreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { existsSync, readFileSync } from "node:fs";
+import { createReadOnlyTools, convertToLlm, type ExtensionContext, type SessionManager } from "@earendil-works/pi-coding-agent";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { Context, Model, ProviderHeaders, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
@@ -58,6 +59,10 @@ export interface CreateMainWatchdogReviewOptions {
 	createReadOnlyTools?: (cwd: string) => AgentTool[];
 	getThinkingLevel?: () => ThinkingLevel | undefined;
 	diffBaseline?: () => WatchdogDiffBaseline | undefined;
+	/** Internal prototype seed; the file must be a guarded planner fork. */
+	seedSessionFile?: string;
+	/** Internal job-local cache; advisors retain context across review calls. */
+	agentCache?: Map<string, Agent>;
 }
 
 function fullModelId(model: Pick<RegistryModel, "provider" | "id">): string {
@@ -277,10 +282,13 @@ function dispatchWatchdogStream(
 }
 
 export function createMainWatchdogReview(provider: WatchdogContextProvider, options: CreateMainWatchdogReviewOptions = {}): WatchdogReviewFunction {
+	if (options.seedSessionFile && !existsSync(options.seedSessionFile)) throw new Error(`Live advisor seed session does not exist: ${options.seedSessionFile}`);
+	const agentCache = options.agentCache;
 	return async (request) => {
 		const ctx = resolveContext(provider);
 		if (!ctx) throw new Error("Main watchdog review cannot run without an active Pi extension context.");
-		const aborted = () => ctx.signal?.aborted || request.signal?.aborted;
+		const contextSignal = ctx.signal;
+		const aborted = () => request.signal?.aborted || contextSignal?.aborted;
 		if (aborted()) return { stopReason: "aborted" };
 		const inherited = !request.config.main.model && ctx.model ? fullModelId(ctx.model) : undefined;
 		const candidates = request.config.main.fallbackModels?.length
@@ -292,7 +300,7 @@ export function createMainWatchdogReview(provider: WatchdogContextProvider, opti
 			const candidate = candidates[index];
 			const config = { ...request.config, main: { ...request.config.main, model: candidate === inherited ? undefined : candidate } };
 			try {
-				const attempt = await runWatchdogAttempt(ctx, { ...request, config }, options);
+				const attempt = await runWatchdogAttempt(ctx, { ...request, config }, { ...options, agentCache });
 				if (aborted()) return { stopReason: "aborted" };
 				if (!attempt.retryable || index === candidates.length - 1) return attempt.result;
 			} catch (error) {
@@ -309,10 +317,11 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 	result: Awaited<ReturnType<WatchdogReviewFunction>>;
 	retryable?: boolean;
 }> {
+	const contextSignal = ctx.signal;
 	const selection = await resolveWatchdogReviewModel(ctx, request.config, {
 		currentThinkingLevel: options.getThinkingLevel?.(),
 	});
-	if (ctx.signal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
+	if (contextSignal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
 	const auth = selection.auth;
 	// SAFETY: Pi supplies this model registry; the named view adds only optional provider lookup hooks used by this adapter.
 	const registry = ctx.modelRegistry as WatchdogModelRegistry;
@@ -320,6 +329,7 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 	const streamFn: StreamFn = (model, context, streamOptions) => {
 		// Agent may enter one final loop iteration after an aborted mixed tool batch.
 		// Never send that iteration to the provider after an intentional yield.
+		if (contextSignal?.aborted || request.signal?.aborted) throw new Error("Watchdog review cancelled.");
 		if (clarification) throw new Error("Watchdog review yielded for clarification.");
 		const requestOptions = {
 			...streamOptions,
@@ -354,15 +364,38 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 		executionMode: "sequential",
 		async execute(_id, rawParams) {
 			const params = rawParams as Static<typeof WatchdogAskParams>;
-			if (warned || clarification || ctx.signal?.aborted || request.signal?.aborted) throw new Error("Clarification unavailable after warning, yield, or cancellation.");
+			if (warned || clarification || contextSignal?.aborted || request.signal?.aborted) throw new Error("Clarification unavailable after warning, yield, or cancellation.");
 			if (!params.question.trim() || !params.evidence.trim()) throw new Error("A focused question and concrete evidence are required.");
 			clarification = { question: boundWatchdogReviewText(params.question.trim(), 1_000), evidence: boundWatchdogReviewText(params.evidence.trim(), 2_000) };
 			agent.abort(); // Intentional yield also stops mixed tool batches; terminate alone does not.
 			return { content: [{ type: "text", text: "Review yielded for clarification." }], details: {} };
 		},
 	});
-	const agent = new Agent({
-		initialState: {
+	const cacheKey = `${selection.model.provider}/${selection.model.id}`;
+	const seededMessages: AgentMessage[] = options.seedSessionFile
+		? (() => {
+			// SAFETY: the native context owns this concrete SessionManager; its public context type omits static methods.
+			const NativeSessionManager = ctx.sessionManager.constructor as typeof SessionManager;
+			if (!(NativeSessionManager.open instanceof Function)) throw new Error("Live advisor requires the native SessionManager.open capability.");
+			// Native opening skips malformed rows and repairs tails; validate the serialized seed first.
+			try {
+				const serialized = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(options.seedSessionFile));
+				if (!serialized.trim() || !serialized.endsWith("\n")) throw new Error("Incomplete seed");
+				for (const line of serialized.split("\n")) {
+					if (line.trim()) JSON.parse(line);
+				}
+			} catch {
+				throw new Error("Live advisor seed is unreadable, empty, or malformed.");
+			}
+			const manager = NativeSessionManager.open(options.seedSessionFile, undefined, ctx.cwd);
+			const messages = manager.buildSessionContext().messages;
+			if (!Array.isArray(messages)) throw new Error("Live advisor seed context is invalid.");
+			return messages;
+		})()
+		: [];
+	const cachedAgent = options.agentCache?.get(cacheKey);
+	const agent = cachedAgent ?? new Agent({
+		initialState: { messages: seededMessages,
 			systemPrompt: buildWatchdogSystemPrompt(ctx, {
 				hasScope: request.hasScope,
 				guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd),
@@ -374,25 +407,30 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 		},
 		convertToLlm,
 		...agentStreamOptions(streamFn),
-		getApiKey: (providerName) => providerName === selection.model.provider ? auth.apiKey : undefined,
-		beforeToolCall: async ({ toolCall }) => !clarification && (WATCHDOG_ALLOWED_TOOL_NAMES.has(toolCall.name) || (request.allowClarification && toolCall.name === "watchdog_ask"))
-			? undefined
-			: { block: true, reason: `Watchdog reviews are read-only; tool '${toolCall.name}' is not allowed.` },
 		toolExecution: "sequential",
 	});
+	if (!cachedAgent) options.agentCache?.set(cacheKey, agent);
+	// Keep only conversation identity across reviews, not request-owned credentials or tool guards.
+	Object.assign(agent, agentStreamOptions(streamFn));
+	agent.getApiKey = (providerName) => providerName === selection.model.provider ? auth.apiKey : undefined;
+	agent.beforeToolCall = async ({ toolCall }) => !clarification && (WATCHDOG_ALLOWED_TOOL_NAMES.has(toolCall.name) || (request.allowClarification && toolCall.name === "watchdog_ask"))
+		? undefined
+		: { block: true, reason: `Watchdog reviews are read-only; tool '${toolCall.name}' is not allowed.` };
+	agent.state.tools = tools;
 	// Include rejected/invalid calls as well as read-only work and findings.
-	agent.subscribe((event) => { if (event.type === "tool_execution_start") toolCount++; });
+	const unsubscribe = agent.subscribe((event) => { if (event.type === "tool_execution_start") toolCount++; });
 	const abort = () => agent.abort();
-	ctx.signal?.addEventListener("abort", abort, { once: true });
+	contextSignal?.addEventListener("abort", abort, { once: true });
 	request.signal?.addEventListener("abort", abort, { once: true });
 	try {
-		if (ctx.signal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
+		if (contextSignal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
 		await agent.prompt(buildReviewPrompt(request, selection));
 	} finally {
-		ctx.signal?.removeEventListener("abort", abort);
+		contextSignal?.removeEventListener("abort", abort);
 		request.signal?.removeEventListener("abort", abort);
+		unsubscribe();
 	}
-	if (ctx.signal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
+	if (contextSignal?.aborted || request.signal?.aborted) return { result: { stopReason: "aborted" } };
 	const terminal = agent.state.messages.findLast((message) => message.role === "assistant");
 	const reason = terminal && "stopReason" in terminal ? terminal.stopReason : undefined;
 	const stopReason = reason === "error" || reason === "aborted" || reason === "length" ? reason : "stop";
