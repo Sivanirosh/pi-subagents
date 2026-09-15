@@ -100,11 +100,20 @@ export function registerChildWatchdog(
 		return effectSettlement("unresolved", reason);
 	};
 	const resolved = childResolvedConfig(childConfig);
+	const advisorAgents = childConfig.liveAdvisorSeedSessionFile ? new Map<string, import("@earendil-works/pi-agent-core").Agent>() : undefined;
 	const runtime = new MainWatchdogRuntime({
 		resolveConfig: () => ({ ok: true, config: resolved, errors: [], sources: [{ scope: "session", exists: true }] }),
-		review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel(), diffBaseline: () => diffBaseline }),
+		review: createMainWatchdogReview(() => currentContext, {
+			getThinkingLevel: () => pi.getThinkingLevel(),
+			diffBaseline: () => diffBaseline,
+			...(childConfig.liveAdvisorSeedSessionFile ? { seedSessionFile: childConfig.liveAdvisorSeedSessionFile, agentCache: advisorAgents } : undefined),
+		}),
 		reviewDescription: "child model review",
-		reviewChangesOnly: true,
+		reviewChangesOnly: !childConfig.liveAdvisorSeedSessionFile,
+		incrementalReviewDeltas: Boolean(childConfig.liveAdvisorSeedSessionFile),
+		onReviewFailure: childConfig.liveAdvisorSeedSessionFile
+			? (reason, status) => emitStatus(status, reason)
+			: undefined,
 		displayWarning: (details, options) => {
 			const childDetails = childWarningDetails(details, childConfig);
 			emitStatus("reviewing", undefined, { severity: childDetails.severity, importance: childDetails.importance, category: childDetails.category, summary: childDetails.summary, evidence: childDetails.evidence, recommendedAction: childDetails.recommendedAction, ...(childDetails.displayedAt ? { displayedAt: childDetails.displayedAt } : {}), addressed: false, stalemate: childDetails.state === "stalemate" });
@@ -188,6 +197,8 @@ export function registerChildWatchdog(
 		observedEffect = undefined;
 		currentContext = undefined;
 		runtime.dispose();
+		for (const agent of advisorAgents?.values() ?? []) agent.abort();
+		advisorAgents?.clear();
 		emitStatus("idle", undefined, undefined, unresolved);
 	});
 	return runtime;

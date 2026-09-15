@@ -399,6 +399,8 @@ export interface SubagentParamsLike {
 	modelOrigin?: ModelOrigin;
 	fast?: boolean;
 	thinking?: string | false;
+	/** Opt in to the single-run live advisor prototype. Unsupported for async/composite/external runs. */
+	liveAdvisor?: boolean;
 	/** Public named workflow resource. Resolved before entering the workflow sandbox. */
 	workflow?: string;
 	args?: Record<string, unknown>;
@@ -501,6 +503,7 @@ interface ExecutionContextData {
 	sessionRoot: string;
 	sessionDirForIndex: (idx?: number) => string;
 	sessionFileForIndex: (idx?: number) => string | undefined;
+	plannerForkSessionFile?: string;
 	sessionFileForTask: ForkSessionFileForTask;
 	thinkingOverrideForTask: ThinkingOverrideForTask;
 	artifactConfig: ArtifactConfig;
@@ -3814,6 +3817,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "single", results: [] } };
 	}
 	const onControlEvent = createForegroundControlNotifier(data, deps);
+	if (params.liveAdvisor === true && !data.plannerForkSessionFile) {
+		return { content: [{ type: "text", text: "liveAdvisor could not capture the planner fork; refusing an unsupervised advisor." }], isError: true, details: { mode: "single", results: [] } };
+	}
 	const childBridgeActive = intercomBridgeAppliesToAgent(data.intercomBridge, contextPolicy, params.agent!);
 	const childIntercomTarget = childBridgeActive ? resolveSubagentIntercomTarget(runId, params.agent!, 0) : undefined;
 	const allProgress: AgentProgress[] = [];
@@ -3857,7 +3863,14 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			source: modelOrigin === "explicit" ? "explicit" : "inherited",
 		},
 	);
-	const modelOverrideFromParent = modelOrigin === "inherited";
+	if (params.liveAdvisor === true) {
+		const requiredWorkerModel = "openai-codex/gpt-5.6-luna";
+		const requiredAdvisorModel = "openai-codex/gpt-6-astra";
+		if (!availableModels.some((candidate) => candidate.fullId === requiredWorkerModel)) return toExecutionErrorResult(params, new Error(`liveAdvisor requires authenticated worker model '${requiredWorkerModel}'.`), data.contextPolicy.contextSummary);
+		if (!availableModels.some((candidate) => candidate.fullId === requiredAdvisorModel)) return toExecutionErrorResult(params, new Error(`liveAdvisor requires authenticated advisor model '${requiredAdvisorModel}'.`), data.contextPolicy.contextSummary);
+		modelOverride = requiredWorkerModel;
+	}
+	const modelOverrideFromParent = params.liveAdvisor === true ? false : modelOrigin === "inherited";
 	const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: agentConfig.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
 	if (launchRuleError) return toExecutionErrorResult(params, new Error(launchRuleError), data.contextPolicy.contextSummary);
 	let skillOverride: string[] | false | undefined = normalizeSkillInput(params.skill);
@@ -3930,7 +3943,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	}
 
 	const authoredTask = task;
-	if (shouldForkAgent(contextPolicy, params.agent!)) {
+	if (shouldForkAgent(contextPolicy, params.agent!) && params.liveAdvisor !== true) {
 		task = wrapForkTask(task);
 	}
 	const cleanTask = task;
@@ -4027,8 +4040,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			llmIntentArbiter: createTaskMutationArbiter({ model: ctx.model, modelRegistry: ctx.modelRegistry, sessionId: ctx.sessionManager.getSessionId() }),
 			childRuntime: deps.childRuntime,
 			onChildSession: (controls) => { childSessionControls = controls; },
-			context: data.contextPolicy.contextForAgent(params.agent!),
+			context: params.liveAdvisor === true ? "fresh" : data.contextPolicy.contextForAgent(params.agent!),
 			unknownAgentDiagnosticContext: data.unknownAgentDiagnosticContext,
+			...(params.liveAdvisor === true ? { liveAdvisorSeedSessionFile: data.plannerForkSessionFile } : undefined),
 			runFanoutBudget: params.runFanoutAdmitted ? data.runFanoutBudget : { ...data.runFanoutBudget, parentPath: `${data.runFanoutBudget.parentPath ? `${data.runFanoutBudget.parentPath}/` : ""}single` },
 			cwd: singleCwd,
 			requestedCwd: data.requestedCwd,
@@ -4061,7 +4075,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			fast: params.fast,
 			modelOverrideFromParent,
 			modelOrigin,
-			thinkingOverride: thinkingOverrideForTask(),
+			thinkingOverride: params.liveAdvisor === true ? "medium" : thinkingOverrideForTask(),
 			thinkingCeiling: agentConfig.maxThinking,
 			extensionBindings: params.extensionBindings,
 			availableModels,
@@ -5016,6 +5030,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		preserveActiveSession = false,
 		parentModelOverride?: ParentModel | null,
 	): Promise<AgentToolResult<Details>> => {
+		if (params.liveAdvisor === true && (params.action !== undefined || params.workflow !== undefined || params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.resume !== undefined || params.machine !== undefined)) {
+			return buildRequestedModeError(params, "liveAdvisor is supported only for one foreground local native Pi agent run, not workflows, management actions, resume, or machine placement.");
+		}
 		const workflowLaunchObserver = workflowLaunchObservers.get(params);
 		const inheritedUsageBudget = workflowOwnedUsageBudgets.get(params);
 		const delegatedThinkingOverride = delegatedThinkingOverrides.get(params);
@@ -6929,7 +6946,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				: undefined;
 			const forkContextResolver = createForkContextResolver(
 				ctx.sessionManager,
-				contextPolicy.usesFork ? "fork" : undefined,
+				(contextPolicy.usesFork || effectiveParams.liveAdvisor === true) ? "fork" : undefined,
 				pruneSession ? { pruneSession } : {},
 			);
 			prepareForkSessionForIndex = forkContextResolver.prepareSessionForIndex;
@@ -6949,6 +6966,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const requestedAsync = externalAsyncRequired ? true : effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
+		if (effectiveParams.liveAdvisor === true && (hasChain || hasTasks || effectiveAsync || externalAgent || agents.some((agent) => selectedAgentNames.includes(agent.name) && agent.machine) || !hasSingle)) {
+			return buildRequestedModeError(effectiveParams, "liveAdvisor is supported only for one foreground native Pi agent run (async:false, no chain/tasks, and no external runner).");
+		}
 		if (externalAgent && (!effectiveAsync || effectiveParams.foregroundOnly === true)) {
 			return buildRequestedModeError(effectiveParams, `Agent '${externalAgent.name}' uses runner.type='${externalAgent.runner?.type}', which currently supports async/background execution only. Omit async or pass async:true; clarify and foregroundOnly are unsupported.`);
 		}
@@ -7037,6 +7057,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const sessionDirForIndex = (idx?: number) =>
 			path.join(sessionRoot, `run-${idx ?? 0}`);
 		const forkSessionFileForTask: ForkSessionFileForTask = (agentName, idx = 0) => {
+			if (effectiveParams.liveAdvisor === true) return undefined;
 			if (!shouldForkAgent(contextPolicy, agentName)) return undefined;
 			return forkSessionFileForIndex(idx);
 		};
@@ -7132,6 +7153,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			sessionRoot,
 			sessionDirForIndex,
 			sessionFileForIndex: childSessionFileForIndex,
+			plannerForkSessionFile: effectiveParams.liveAdvisor === true ? forkSessionFileForIndex(0) : undefined,
 			sessionFileForTask: childSessionFileForTask,
 			thinkingOverrideForTask,
 			artifactConfig,

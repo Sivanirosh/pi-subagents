@@ -357,6 +357,7 @@ const SubagentParamProperties = {
 		enum: ["fresh", "fork", "profile"],
 		description: "fresh/fork overrides every child; profile requires agent's declared defaultContext, ignoring config. Omitted: defaultSubagentContext wins over each agent defaultContext; implicit fork needs persisted parent + leaf, else fresh. forkContext may prune forks before spawn.",
 	})),
+	liveAdvisor: Type.Optional(Type.Boolean({ description: "Single-run prototype: persist one read-only advisor seeded from the planner fork and steer the fresh worker on drift; rejects async, composite, and external runs." })),
 	async: Type.Optional(Type.Boolean({ description: "Background; default asyncByDefault. false only to block parent." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Timeout. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs." })),
 	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs (same defaults)." })),
