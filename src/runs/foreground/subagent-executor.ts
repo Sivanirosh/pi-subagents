@@ -9,6 +9,7 @@ import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilient-json.ts";
 import { isStorageCapacityError } from "../../shared/file-system-retry.ts";
 import { resolveEffectiveThinking, toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import { DEFAULT_LIVE_ADVISOR_MODELS, resolveLiveAdvisorModels, type LiveAdvisorModels } from "../shared/live-advisor-models.ts";
 import {
 	beginForegroundChild,
 	finishForegroundChild,
@@ -401,6 +402,8 @@ export interface SubagentParamsLike {
 	thinking?: string | false;
 	/** Opt in to the single-run live advisor prototype. Unsupported for async/composite/external runs. */
 	liveAdvisor?: boolean;
+	/** Internal per-assignment selection; not exposed by the public tool schema. */
+	liveAdvisorModels?: LiveAdvisorModels;
 	/** Public named workflow resource. Resolved before entering the workflow sandbox. */
 	workflow?: string;
 	args?: Record<string, unknown>;
@@ -3863,12 +3866,14 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			source: modelOrigin === "explicit" ? "explicit" : "inherited",
 		},
 	);
+	let liveAdvisorModels: LiveAdvisorModels | undefined;
 	if (params.liveAdvisor === true) {
-		const requiredWorkerModel = "openai-codex/gpt-5.6-luna";
-		const requiredAdvisorModel = "openai-codex/gpt-6-astra";
-		if (!availableModels.some((candidate) => candidate.fullId === requiredWorkerModel)) return toExecutionErrorResult(params, new Error(`liveAdvisor requires authenticated worker model '${requiredWorkerModel}'.`), data.contextPolicy.contextSummary);
-		if (!availableModels.some((candidate) => candidate.fullId === requiredAdvisorModel)) return toExecutionErrorResult(params, new Error(`liveAdvisor requires authenticated advisor model '${requiredAdvisorModel}'.`), data.contextPolicy.contextSummary);
-		modelOverride = requiredWorkerModel;
+		try {
+			liveAdvisorModels = resolveLiveAdvisorModels(params.liveAdvisorModels === undefined ? DEFAULT_LIVE_ADVISOR_MODELS : params.liveAdvisorModels, ctx.modelRegistry.getAvailable());
+		} catch (error) {
+			return toExecutionErrorResult(params, error instanceof Error ? error : new Error(String(error)), data.contextPolicy.contextSummary);
+		}
+		modelOverride = liveAdvisorModels.worker.model;
 	}
 	const modelOverrideFromParent = params.liveAdvisor === true ? false : modelOrigin === "inherited";
 	const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: agentConfig.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
@@ -3977,7 +3982,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	let childSessionControls: ForegroundChildSessionControls | undefined;
 	const foregroundControl = deps.state.foregroundControls.get(runId);
 	if (foregroundControl) {
-		const thinking = resolveEffectiveThinking(modelOverride, thinkingOverrideForTask());
+		const thinking = resolveEffectiveThinking(modelOverride, liveAdvisorModels?.worker.thinking ?? thinkingOverrideForTask());
 		beginForegroundChild(foregroundControl, omitUndefinedProperties({
 			index: 0,
 			agent: params.agent!,
@@ -4042,7 +4047,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			onChildSession: (controls) => { childSessionControls = controls; },
 			context: params.liveAdvisor === true ? "fresh" : data.contextPolicy.contextForAgent(params.agent!),
 			unknownAgentDiagnosticContext: data.unknownAgentDiagnosticContext,
-			...(params.liveAdvisor === true ? { liveAdvisorSeedSessionFile: data.plannerForkSessionFile } : undefined),
+			...(liveAdvisorModels ? { liveAdvisorSeedSessionFile: data.plannerForkSessionFile, liveAdvisorModel: liveAdvisorModels.advisor } : undefined),
 			runFanoutBudget: params.runFanoutAdmitted ? data.runFanoutBudget : { ...data.runFanoutBudget, parentPath: `${data.runFanoutBudget.parentPath ? `${data.runFanoutBudget.parentPath}/` : ""}single` },
 			cwd: singleCwd,
 			requestedCwd: data.requestedCwd,
@@ -4074,8 +4079,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			modelOverride,
 			fast: params.fast,
 			modelOverrideFromParent,
-			modelOrigin,
-			thinkingOverride: params.liveAdvisor === true ? "medium" : thinkingOverrideForTask(),
+			modelOrigin: liveAdvisorModels ? "explicit" : modelOrigin,
+			thinkingOverride: liveAdvisorModels?.worker.thinking ?? thinkingOverrideForTask(),
 			thinkingCeiling: agentConfig.maxThinking,
 			extensionBindings: params.extensionBindings,
 			availableModels,
