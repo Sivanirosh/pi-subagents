@@ -1,5 +1,6 @@
 import type { ChildWatchdogEffectSettlement, ChildWatchdogProgress, ChildWatchdogWarningSummary } from "../shared/types.ts";
 import { WATCHDOG_WARNING_CATEGORIES, WATCHDOG_WARNING_IMPORTANCES, type ResolvedWatchdogConfig, type WatchdogCadenceConfig, type WatchdogLspConfig } from "./types.ts";
+import { DEFAULT_LIVE_ADVISOR_MODELS, type LiveAdvisorModel } from "../runs/shared/live-advisor-models.ts";
 
 export const CHILD_WATCHDOG_WARNING_LIMIT = 20;
 
@@ -51,13 +52,15 @@ export function resolveChildWatchdogConfig(input: {
 	childIndex?: number;
 	liveAdvisorSeedSessionFile?: string;
 	forceLiveAdvisor?: boolean;
+	liveAdvisorModel?: LiveAdvisorModel;
 }): ChildWatchdogConfig | undefined {
 	const override = input.agent ? input.config.children.overrides[input.agent] : undefined;
 	const enabled = input.forceLiveAdvisor === true || (input.config.enabled && (override?.enabled ?? input.config.children.enabled));
 	if (!enabled) return undefined;
-	const model = input.forceLiveAdvisor ? "openai-codex/gpt-6-astra" : override?.model ?? input.config.children.model;
+	const advisor = input.liveAdvisorModel ?? DEFAULT_LIVE_ADVISOR_MODELS.advisor;
+	const model = input.forceLiveAdvisor ? advisor.model : override?.model ?? input.config.children.model;
 	const fallbackModels = input.forceLiveAdvisor ? [] : override?.fallbackModels ?? input.config.children.fallbackModels;
-	const thinking = input.forceLiveAdvisor ? "xhigh" : override?.thinking ?? input.config.children.thinking;
+	const thinking = input.forceLiveAdvisor ? advisor.thinking : override?.thinking ?? input.config.children.thinking;
 	const blockOnFailure = override?.blockOnFailure ?? input.config.children.blockOnFailure;
 	const cadence = input.forceLiveAdvisor ? { everyNTools: 1 } : override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
 	return {

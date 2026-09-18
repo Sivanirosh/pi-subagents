@@ -391,7 +391,7 @@ async function runSingleAttempt(
 			agent: agent.name,
 			runId: options.runId,
 			childIndex: options.index ?? 0,
-			...(options.liveAdvisorSeedSessionFile ? { liveAdvisorSeedSessionFile: options.liveAdvisorSeedSessionFile, forceLiveAdvisor: true } : undefined),
+			...(options.liveAdvisorSeedSessionFile ? { liveAdvisorSeedSessionFile: options.liveAdvisorSeedSessionFile, forceLiveAdvisor: true, liveAdvisorModel: options.liveAdvisorModel } : undefined),
 		})
 		: undefined;
 	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);

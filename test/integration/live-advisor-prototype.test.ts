@@ -117,7 +117,7 @@ async function nativeFixture() {
 	const agentDir = join(cwd, "agent"); mkdirSync(agentDir);
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false, provider: { maxRetries: 0 } }, compaction: { enabled: false } }));
 	writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ "openai-codex": { type: "oauth", access: "fixture-token", refresh: "fixture-refresh", expires: Date.now() + 86_400_000 } }));
-	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { "openai-codex": { baseUrl: "https://synthetic.invalid/v1", api: "openai-completions", models: ["gpt-5.6-luna", "gpt-6-astra"].map((id) => ({ id, name: id, api: "openai-completions", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } } }));
+	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { "openai-codex": { baseUrl: "https://synthetic.invalid/v1", api: "openai-completions", models: ["gpt-5.6-luna", "gpt-6-astra"].map((id) => ({ id, name: id, api: "openai-completions", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], contextWindow: 128000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } } }));
 	const settingsManager = pi.SettingsManager.create(cwd, agentDir);
 	const context = deferred<ExtensionContext>(); const apiReady = deferred<ExtensionAPI>();
 	const resourceLoader = new pi.DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(api) => {

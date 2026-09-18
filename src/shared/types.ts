@@ -2415,6 +2415,7 @@ export interface RunSyncOptions {
 	unknownAgentDiagnosticContext?: import("../agents/agents.ts").UnknownAgentDiagnosticContext;
 	/** Internal live-advisor seed captured by the foreground planner; never caller-supplied. */
 	liveAdvisorSeedSessionFile?: string;
+	liveAdvisorModel?: import("../runs/shared/live-advisor-models.ts").LiveAdvisorModel;
 	/** Session factory for the in-process child; defaults to the process-wide factory. */
 	childSessionFactory?: import("../runs/shared/child-session.ts").ChildSessionFactory;
 	/** The launching executor's own child runtime when it is itself an in-process child. */

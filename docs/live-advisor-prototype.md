@@ -4,9 +4,10 @@ This is an explicit, foreground-only prototype for one worker and one job-local 
 
 ## Behavior
 
-- The worker uses `openai-codex/gpt-5.6-luna` at medium effort and starts fresh.
-- The advisor uses `openai-codex/gpt-6-astra` at xhigh effort. It receives an actual native fork of the persisted planner session and retains context within the job.
-- Missing required models and unsupported execution modes fail before launch. There is no model fallback.
+- The public tool defaults to a fresh worker using `openai-codex/gpt-5.6-luna` at medium effort and an advisor using `openai-codex/gpt-6-astra` at xhigh effort.
+- Native executor hosts can supply `liveAdvisorModels: { worker: { model, thinking }, advisor: { model, thinking } }` for one assignment. `resolveLiveAdvisorModels` validates exact authenticated model IDs and supported thinking levels and returns an immutable snapshot. The executor validates the selection again before launch. This internal field is not exposed by the public tool schema; the engine reads no model configuration file.
+- The advisor receives an actual native fork of the persisted planner session and retains context within the job.
+- Missing required models, unsupported thinking levels, malformed selections, and unsupported execution modes fail before launch. There is no model fallback.
 - Current-job advisor corrections clarify planner requirements and take precedence over conflicting task notes. They do not grant additional tools, filesystem permissions or scope. Parent, stale and other-job warnings remain filtered.
 - Advisor failure or timeout cancels pending worker work. Cancellation and disposal invalidate pending reviews. A new job gets a new advisor lifecycle.
 - Seed integrity is checked before native opening. Context construction remains native; JSON parsing does not reconstruct session context.
